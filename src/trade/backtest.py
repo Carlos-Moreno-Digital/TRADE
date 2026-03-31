@@ -28,6 +28,28 @@ from trade.data.providers import MarketDataProvider
 console = Console()
 
 # Correlation pairs that should NOT be traded simultaneously
+# Realistic spreads in price units (what FunderPro/TradeLocker charges)
+SPREADS = {
+    # Forex majors (tight)
+    "EURUSD=X": 0.00012, "GBPUSD=X": 0.00015, "USDJPY=X": 0.012,
+    "AUDUSD=X": 0.00015, "NZDUSD=X": 0.00018, "USDCAD=X": 0.00018,
+    "USDCHF=X": 0.00015,
+    # Forex crosses (wider)
+    "EURGBP=X": 0.00018, "EURJPY=X": 0.018, "GBPJPY=X": 0.025,
+    "EURNZD=X": 0.00030, "EURAUD=X": 0.00025, "EURCAD=X": 0.00025,
+    "EURCHF=X": 0.00020, "GBPAUD=X": 0.00030, "GBPNZD=X": 0.00035,
+    "GBPCAD=X": 0.00028, "GBPCHF=X": 0.00025,
+    "AUDJPY=X": 0.020, "NZDJPY=X": 0.022, "CADJPY=X": 0.020,
+    "CHFJPY=X": 0.022, "AUDNZD=X": 0.00025, "AUDCAD=X": 0.00025,
+    # Commodities (wider)
+    "GC=F": 0.40, "SI=F": 0.03, "CL=F": 0.04, "PL=F": 1.50,
+    # Crypto (widest)
+    "BTC-USD": 50.0, "ETH-USD": 2.0,
+}
+
+# Slippage as fraction of spread (50% of spread = realistic)
+SLIPPAGE_FRACTION = 0.5
+
 CORRELATED_PAIRS = {
     frozenset(["EURUSD=X", "GBPUSD=X"]): 0.85,
     frozenset(["EURUSD=X", "USDCHF=X"]): 0.95,
@@ -151,26 +173,27 @@ class Backtester:
                     if close_price <= pos.entry_price - risk_dist * 2.0 and pos.stop_loss > pos.entry_price - risk_dist * 0.5:
                         pos.stop_loss = pos.entry_price - risk_dist * 0.5
 
-                # SL/TP check
+                # SL/TP check (with slippage on exits)
+                exit_slip = SPREADS.get(pos.symbol, close_price * 0.0003) * SLIPPAGE_FRACTION
                 if pos.side == "long":
                     if low <= pos.stop_loss:
-                        pos.exit_price = pos.stop_loss
+                        pos.exit_price = pos.stop_loss - exit_slip  # SL fills worse
                         pos.exit_reason = "SL" if pos.stop_loss <= pos.entry_price else "TSL"
                         pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
                         positions_to_close.append(pos)
                     elif high >= pos.take_profit:
-                        pos.exit_price = pos.take_profit
+                        pos.exit_price = pos.take_profit - exit_slip  # TP fills slightly worse
                         pos.exit_reason = "TP"
                         pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
                         positions_to_close.append(pos)
                 elif pos.side == "short":
                     if high >= pos.stop_loss:
-                        pos.exit_price = pos.stop_loss
+                        pos.exit_price = pos.stop_loss + exit_slip  # SL fills worse for shorts
                         pos.exit_reason = "SL" if pos.stop_loss >= pos.entry_price else "TSL"
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
                     elif low <= pos.take_profit:
-                        pos.exit_price = pos.take_profit
+                        pos.exit_price = pos.take_profit + exit_slip  # TP slightly worse
                         pos.exit_reason = "TP"
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
@@ -282,10 +305,19 @@ class Backtester:
                         continue
 
                     side = "long" if signal["action"] == "buy" else "short"
-                    pos = Position(signal["symbol"], side, entry_price, round(quantity, 4),
+
+                    # REALISTIC: Apply spread + slippage to entry
+                    spread = SPREADS.get(signal["symbol"], entry_price * 0.0003)
+                    slippage = spread * SLIPPAGE_FRACTION
+                    if side == "long":
+                        fill_price = entry_price + spread / 2 + slippage  # Buy at ask
+                    else:
+                        fill_price = entry_price - spread / 2 - slippage  # Sell at bid
+
+                    pos = Position(signal["symbol"], side, fill_price, round(quantity, 4),
                                    sl, tp, date_str)
                     if side == "long":
-                        cash -= entry_price * quantity
+                        cash -= fill_price * quantity
                     open_positions.append(pos)
 
             # 4. UPDATE equity
