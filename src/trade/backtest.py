@@ -111,7 +111,7 @@ class Backtester:
         for i, date in enumerate(sim_dates):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, 'strftime') else str(date)[:10]
 
-            # 1. CHECK SL/TP on open positions using today's high/low
+            # 1. CHECK SL/TP + TRAILING STOP on open positions
             positions_to_close = []
             for pos in open_positions:
                 df = all_data.get(pos.symbol)
@@ -123,12 +123,27 @@ class Backtester:
                 today = df[mask].iloc[-1]
                 high = float(today["high"])
                 low = float(today["low"])
-                close = float(today["close"])
+                close_price = float(today["close"])
+
+                # TRAILING STOP: move SL to breakeven when price moves 1x risk in our favor
+                risk_dist = abs(pos.entry_price - pos.stop_loss)
+                if pos.side == "long":
+                    # If price is 1x risk above entry, move SL to entry (breakeven)
+                    if close_price >= pos.entry_price + risk_dist and pos.stop_loss < pos.entry_price:
+                        pos.stop_loss = pos.entry_price + risk_dist * 0.1  # Tiny profit lock
+                    # If price is 1.5x risk above, trail SL to 0.5x risk above entry
+                    if close_price >= pos.entry_price + risk_dist * 1.5 and pos.stop_loss < pos.entry_price + risk_dist * 0.5:
+                        pos.stop_loss = pos.entry_price + risk_dist * 0.5
+                elif pos.side == "short":
+                    if close_price <= pos.entry_price - risk_dist and pos.stop_loss > pos.entry_price:
+                        pos.stop_loss = pos.entry_price - risk_dist * 0.1
+                    if close_price <= pos.entry_price - risk_dist * 1.5 and pos.stop_loss > pos.entry_price - risk_dist * 0.5:
+                        pos.stop_loss = pos.entry_price - risk_dist * 0.5
 
                 if pos.side == "long":
                     if low <= pos.stop_loss:
                         pos.exit_price = pos.stop_loss
-                        pos.exit_reason = "SL"
+                        pos.exit_reason = "SL" if pos.stop_loss <= pos.entry_price else "TSL"
                         pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
                         positions_to_close.append(pos)
                     elif high >= pos.take_profit:
@@ -139,7 +154,7 @@ class Backtester:
                 elif pos.side == "short":
                     if high >= pos.stop_loss:
                         pos.exit_price = pos.stop_loss
-                        pos.exit_reason = "SL"
+                        pos.exit_reason = "SL" if pos.stop_loss >= pos.entry_price else "TSL"
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
                     elif low <= pos.take_profit:
@@ -300,79 +315,95 @@ class Backtester:
             if atr_val <= 0:
                 return None
 
-            # === SCORING (more granular, 0-10 scale) ===
+            # === MAJOR TREND FILTER (THE KEY RULE) ===
+            # Price vs EMA50 determines allowed direction
+            # If price > EMA50: ONLY LONGS (buy pullbacks in uptrend)
+            # If price < EMA50: ONLY SHORTS (sell rallies in downtrend)
+            major_trend = "bullish" if latest > ema50_val else "bearish"
+
+            # 20-day momentum for trend confirmation
+            if len(close) >= 20:
+                mom20 = (latest - float(close[-20])) / float(close[-20]) * 100
+            else:
+                mom20 = 0
+
+            # === SCORING ===
             bull_score = 0
             bear_score = 0
 
-            # Trend (EMA alignment)
+            # Trend alignment (EMA stack)
             if ema9_val > ema21_val > ema50_val:
-                bull_score += 2  # Strong uptrend
+                bull_score += 3  # Perfect uptrend alignment
             elif ema9_val > ema21_val:
-                bull_score += 1  # Moderate uptrend
+                bull_score += 1
             if ema9_val < ema21_val < ema50_val:
-                bear_score += 2  # Strong downtrend
+                bear_score += 3
             elif ema9_val < ema21_val:
                 bear_score += 1
 
-            # RSI
-            if rsi_val < 35:
-                bull_score += 1  # Oversold zone
-            if rsi_val < 25:
-                bull_score += 1  # Deep oversold
-            if rsi_val > 65:
-                bear_score += 1
-            if rsi_val > 75:
-                bear_score += 1
+            # RSI - look for pullbacks within trend, not reversals
+            if major_trend == "bullish":
+                # In uptrend: buy when RSI pulls back to 40-50 (not just oversold)
+                if 35 <= rsi_val <= 50:
+                    bull_score += 2  # Pullback in uptrend = best entry
+                if rsi_val < 35:
+                    bull_score += 1  # Oversold in uptrend
+            else:
+                # In downtrend: sell when RSI bounces to 50-65
+                if 50 <= rsi_val <= 65:
+                    bear_score += 2
+                if rsi_val > 65:
+                    bear_score += 1
 
-            # MACD momentum + crossover
+            # MACD
             if macd_val > 0:
                 bull_score += 1
             if macd_val < 0:
                 bear_score += 1
-            # MACD crossover (histogram flips sign)
             if macd_prev <= 0 < macd_val:
-                bull_score += 2  # Bullish crossover = strong signal
+                bull_score += 2  # Bullish crossover
             if macd_prev >= 0 > macd_val:
-                bear_score += 2  # Bearish crossover
+                bear_score += 2
 
-            # Stochastic
-            if stoch_val < 25:
-                bull_score += 1
-            if stoch_val > 75:
+            # Stochastic - confirming pullback entries
+            if major_trend == "bullish" and stoch_val < 30:
+                bull_score += 1  # Oversold in uptrend
+            if major_trend == "bearish" and stoch_val > 70:
                 bear_score += 1
 
-            # Bollinger Bands
-            if latest <= bb_lower:
-                bull_score += 1  # Price at lower band = bounce
-            if latest >= bb_upper:
-                bear_score += 1
+            # Bollinger
+            if major_trend == "bullish" and latest <= bb_lower:
+                bull_score += 2  # Price hit lower band in uptrend = strong buy
+            if major_trend == "bearish" and latest >= bb_upper:
+                bear_score += 2
 
-            # Momentum (3-day and 5-day)
-            if len(close) >= 5:
-                mom5 = (latest - float(close[-5])) / float(close[-5]) * 100
-                if mom5 > 0.5:
-                    bull_score += 1
-                elif mom5 < -0.5:
-                    bear_score += 1
+            # Short-term momentum (for entry timing)
             if len(close) >= 3:
                 mom3 = (latest - float(close[-3])) / float(close[-3]) * 100
-                if mom3 > 0.3:
+                if mom3 > 0.2:
                     bull_score += 1
-                elif mom3 < -0.3:
+                elif mom3 < -0.2:
                     bear_score += 1
 
-            # === DECISION ===
+            # === DECISION (with trend filter) ===
             action = "hold"
             confidence = 0.0
             net_score = bull_score - bear_score
 
-            # Score >= 2 = trade (was 3 - now more active)
-            if net_score >= 2 and bull_score >= 3:
+            # ONLY trade WITH the major trend
+            if major_trend == "bullish" and net_score >= 2 and bull_score >= 3:
                 action = "buy"
-                confidence = min(0.9, bull_score * 0.12)
-            elif net_score <= -2 and bear_score >= 3:
+                confidence = min(0.9, bull_score * 0.1)
+            elif major_trend == "bearish" and net_score <= -2 and bear_score >= 3:
                 action = "sell"
-                confidence = min(0.9, bear_score * 0.12)
+                confidence = min(0.9, bear_score * 0.1)
+            # Counter-trend trades only on VERY strong signals
+            elif major_trend == "bullish" and net_score <= -4 and bear_score >= 5:
+                action = "sell"  # Only short in uptrend with extreme signal
+                confidence = 0.4
+            elif major_trend == "bearish" and net_score >= 4 and bull_score >= 5:
+                action = "buy"
+                confidence = 0.4
 
             if action == "hold":
                 return None
