@@ -1,52 +1,99 @@
-# FunderPro Prop Firm Configuration
-# https://funderpro.com
-# EA allowed, News trading OK, No time limit, Weekend holding with Swing Add-on
+# FunderPro CLASSIC $25K Challenge Configuration
+# https://funderpro.com/the-challenge/
+# EA allowed, News trading OK, No time limit, No consistency rule
+# Leverage: Forex 1:100, Metals/Oil/Indices 1:30, Crypto 1:2, Stocks 1:5
 
-name: funderpro
+name: funderpro_classic_25k
 phase: challenge_1  # challenge_1 | challenge_2 | funded
 
-# Actual FunderPro limits
-firm_profit_target_pct: 8.0       # Phase 1: 8%
-firm_max_daily_loss_pct: 5.0      # 5% daily loss limit
-firm_max_total_drawdown_pct: 10.0 # 10% total drawdown
+# =============================================
+# ACTUAL FUNDERPRO CLASSIC $25K LIMITS
+# =============================================
+# Account size: $25,000
+# Cost: $219 (refundable)
+# Phase 1 target: 10% ($2,500)
+# Phase 2 target: 5% ($1,250)
+# Daily loss: 5% ($1,250)
+# Max drawdown: 10% ($2,500)
+# Min trading days: 4
+# Time limit: UNLIMITED
+# Consistency rule: NONE
+# Leverage Forex: 1:100
+# =============================================
 
-# OUR SAFETY BUFFERS (20% below firm limits)
-max_daily_loss_pct: 4.0           # We stop at 4% (firm: 5%)
-max_total_drawdown_pct: 8.0       # We stop at 8% (firm: 10%)
-hard_stop_daily_pct: 3.0          # HARD STOP at 3%
-hard_stop_drawdown_pct: 7.0       # HARD STOP at 7%
+account_size: 25000
+challenge_cost: 219
 
-# Position sizing (conservative for challenge)
-max_risk_per_trade_pct: 0.75
-default_risk_per_trade_pct: 0.5
+firm_profit_target_pct: 10.0      # Phase 1: 10% ($2,500)
+firm_profit_target_phase2_pct: 5.0  # Phase 2: 5% ($1,250)
+firm_max_daily_loss_pct: 5.0      # 5% = $1,250 daily loss limit
+firm_max_total_drawdown_pct: 10.0 # 10% = $2,500 total drawdown
+firm_min_trading_days: 4
+firm_time_limit_days: 0           # 0 = unlimited
+firm_consistency_rule: false
+
+# =============================================
+# OUR SAFETY BUFFERS (we stop BEFORE firm limits)
+# =============================================
+max_daily_loss_pct: 4.0           # We stop at 4% = $1,000 (firm: 5% = $1,250)
+max_total_drawdown_pct: 8.0       # We stop at 8% = $2,000 (firm: 10% = $2,500)
+hard_stop_daily_pct: 3.5          # HARD STOP at 3.5% = $875
+hard_stop_drawdown_pct: 7.0       # HARD STOP at 7% = $1,750
+
+# =============================================
+# POSITION SIZING (conservative for challenge)
+# =============================================
+# With $25K and 0.5% risk = $125 per trade
+# At 1:2 RR and 50% win rate, need ~20 trades to hit $2,500 target
+max_risk_per_trade_pct: 0.75      # Max: $187.50 per trade
+default_risk_per_trade_pct: 0.5   # Default: $125 per trade
 max_open_trades: 3
-max_lots_per_trade: 2.0
+max_lots_per_trade: 2.0           # Forex standard lots
 
-# Risk:Reward
-min_risk_reward_ratio: 1.5
-target_risk_reward_ratio: 2.0
+# =============================================
+# RISK:REWARD REQUIREMENTS
+# =============================================
+min_risk_reward_ratio: 1.5        # Minimum acceptable
+target_risk_reward_ratio: 2.0     # Ideal target
 
-# Consistency (spread profit across trades)
-consistency_max_day_pct: 25.0
-max_trades_per_day: 5
-min_trades_for_target: 15
+# =============================================
+# CONSISTENCY (even without firm rule, spread profit)
+# =============================================
+consistency_max_day_pct: 35.0     # Best day < 35% total profit (our rule)
+max_trades_per_day: 5             # Quality over quantity
+min_trades_for_target: 15         # Spread across 15+ trades
 
-# FunderPro allows all of these
+# =============================================
+# TRADING PERMISSIONS (FunderPro Classic)
+# =============================================
 news_trading_allowed: true
-news_blackout_minutes: 2          # Small buffer even though allowed
-weekend_holding_allowed: true     # With Swing Add-on
+news_blackout_minutes: 2          # Small safety buffer
+weekend_holding_allowed: true
 ea_trading_allowed: true
 hedging_allowed: true
-martingale_allowed: false         # NEVER
-grid_trading_allowed: false       # NEVER
+martingale_allowed: false         # ABSOLUTELY NEVER
+grid_trading_allowed: false       # ABSOLUTELY NEVER
 
-# Best sessions for forex
+# =============================================
+# LEVERAGE (FunderPro Classic)
+# =============================================
+leverage_forex: 100
+leverage_metals: 30
+leverage_indices: 30
+leverage_crypto: 2
+leverage_stocks: 5
+
+# =============================================
+# SESSION & TIMING
+# =============================================
 allowed_sessions:
   - london
   - new_york
   - london_ny_overlap
 
-# After 2 consecutive losses, wait 60 minutes
+# =============================================
+# COOLDOWN RULES
+# =============================================
 consecutive_loss_cooldown_minutes: 60
 consecutive_loss_threshold: 2
 daily_loss_cooldown_until_next_day: true
