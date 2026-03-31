@@ -1,0 +1,52 @@
+# FunderPro Prop Firm Configuration
+# https://funderpro.com
+# EA allowed, News trading OK, No time limit, Weekend holding with Swing Add-on
+
+name: funderpro
+phase: challenge_1  # challenge_1 | challenge_2 | funded
+
+# Actual FunderPro limits
+firm_profit_target_pct: 8.0       # Phase 1: 8%
+firm_max_daily_loss_pct: 5.0      # 5% daily loss limit
+firm_max_total_drawdown_pct: 10.0 # 10% total drawdown
+
+# OUR SAFETY BUFFERS (20% below firm limits)
+max_daily_loss_pct: 4.0           # We stop at 4% (firm: 5%)
+max_total_drawdown_pct: 8.0       # We stop at 8% (firm: 10%)
+hard_stop_daily_pct: 3.0          # HARD STOP at 3%
+hard_stop_drawdown_pct: 7.0       # HARD STOP at 7%
+
+# Position sizing (conservative for challenge)
+max_risk_per_trade_pct: 0.75
+default_risk_per_trade_pct: 0.5
+max_open_trades: 3
+max_lots_per_trade: 2.0
+
+# Risk:Reward
+min_risk_reward_ratio: 1.5
+target_risk_reward_ratio: 2.0
+
+# Consistency (spread profit across trades)
+consistency_max_day_pct: 25.0
+max_trades_per_day: 5
+min_trades_for_target: 15
+
+# FunderPro allows all of these
+news_trading_allowed: true
+news_blackout_minutes: 2          # Small buffer even though allowed
+weekend_holding_allowed: true     # With Swing Add-on
+ea_trading_allowed: true
+hedging_allowed: true
+martingale_allowed: false         # NEVER
+grid_trading_allowed: false       # NEVER
+
+# Best sessions for forex
+allowed_sessions:
+  - london
+  - new_york
+  - london_ny_overlap
+
+# After 2 consecutive losses, wait 60 minutes
+consecutive_loss_cooldown_minutes: 60
+consecutive_loss_threshold: 2
+daily_loss_cooldown_until_next_day: true

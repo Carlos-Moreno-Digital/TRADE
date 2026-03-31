@@ -1,0 +1,50 @@
+# FTMO Prop Firm Configuration
+# https://ftmo.com
+# Stricter rules, most well-known prop firm
+
+name: ftmo
+phase: challenge_1  # challenge | verification | funded
+
+# Actual FTMO limits
+firm_profit_target_pct: 10.0       # Phase 1: 10%, Phase 2: 5%
+firm_max_daily_loss_pct: 5.0       # 5% of daily starting balance
+firm_max_total_drawdown_pct: 10.0  # 10% from initial balance
+
+# Safety buffers
+max_daily_loss_pct: 4.0
+max_total_drawdown_pct: 8.0
+hard_stop_daily_pct: 3.5
+hard_stop_drawdown_pct: 7.5
+
+# Conservative position sizing
+max_risk_per_trade_pct: 0.75
+default_risk_per_trade_pct: 0.5
+max_open_trades: 3
+max_lots_per_trade: 3.0
+
+# Risk:Reward
+min_risk_reward_ratio: 1.5
+target_risk_reward_ratio: 2.5
+
+# Consistency
+consistency_max_day_pct: 30.0
+max_trades_per_day: 5
+min_trades_for_target: 20
+
+# FTMO restrictions
+news_trading_allowed: true
+news_blackout_minutes: 5
+weekend_holding_allowed: false
+ea_trading_allowed: true
+hedging_allowed: true
+martingale_allowed: false
+grid_trading_allowed: false
+
+allowed_sessions:
+  - london
+  - new_york
+  - london_ny_overlap
+
+consecutive_loss_cooldown_minutes: 90
+consecutive_loss_threshold: 2
+daily_loss_cooldown_until_next_day: true
