@@ -165,7 +165,8 @@ class DemoRunner:
         self.scanner.print_scan_results(scan_results)
 
         # PHASE 2: Get top candidates for deep analysis
-        top_candidates = self.scanner.get_top_candidates(active_instruments, now)
+        # Reuse scan_results to avoid double-scanning
+        top_candidates = self.scanner.get_top_candidates(scan_results=scan_results)
 
         if not top_candidates:
             console.print("[yellow]No strong setups found. All markets flat or weak.[/yellow]")

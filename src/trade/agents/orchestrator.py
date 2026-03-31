@@ -166,8 +166,10 @@ class Orchestrator:
         # Run Smart Money analysis on available data
         try:
             from trade.analysis.smart_money import get_smc_analysis
-            smc_df = context.metadata.get("historical_df_1h") or context.metadata.get("historical_df")
-            if smc_df is not None and not smc_df.empty:
+            smc_df = context.metadata.get("historical_df_1h")
+            if smc_df is None or (hasattr(smc_df, 'empty') and smc_df.empty):
+                smc_df = context.metadata.get("historical_df")
+            if smc_df is not None and hasattr(smc_df, 'empty') and not smc_df.empty:
                 smc = get_smc_analysis(smc_df)
                 context.metadata["smc"] = smc
                 if smc.get("available"):

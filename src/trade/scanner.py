@@ -118,9 +118,8 @@ CRYPTO = [
     ("AVAX-USD", "crypto", "Avalanche"),
     ("LINK-USD", "crypto", "Chainlink"),
     ("DOT-USD", "crypto", "Polkadot"),
-    ("MATIC-USD", "crypto", "Polygon"),
     ("NEAR-USD", "crypto", "NEAR"),
-    ("UNI-USD", "crypto", "Uniswap"),
+    ("SUI-USD", "crypto", "Sui"),
 ]
 
 US_STOCKS = [
@@ -164,7 +163,6 @@ US_STOCKS = [
     ("CVX", "stock_us", "Chevron"),
     # === POPULAR/VOLATILE ===
     ("COIN", "stock_us", "Coinbase"),
-    ("SQ", "stock_us", "Block/SQ"),
     ("RIVN", "stock_us", "Rivian"),
     ("SOFI", "stock_us", "SoFi"),
 ]
@@ -375,14 +373,22 @@ class MarketScanner:
 
     def get_top_candidates(
         self,
+        scan_results: list[ScanResult] | None = None,
         instruments: list[tuple[str, str, str]] | None = None,
         now_utc: datetime | None = None,
     ) -> list[ScanResult]:
-        """Get the top N candidates for deep analysis."""
-        all_results = self.quick_scan(instruments, now_utc)
+        """Get the top N candidates for deep analysis.
+
+        Args:
+            scan_results: Pre-computed scan results (avoids double-scanning).
+            instruments: If scan_results is None, scan these instruments.
+            now_utc: Current time.
+        """
+        if scan_results is None:
+            scan_results = self.quick_scan(instruments, now_utc)
 
         # Filter: must have some directional bias (not flat)
-        candidates = [r for r in all_results if abs(r.score) > 0.1 and r.is_open]
+        candidates = [r for r in scan_results if abs(r.score) > 0.1 and r.is_open]
 
         top = candidates[:self.top_n]
 
