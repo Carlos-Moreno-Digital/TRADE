@@ -183,18 +183,25 @@ class Backtester:
                 open_positions.remove(pos)
                 closed_trades.append(pos)
 
-            # 2. CHECK consecutive losses - cooldown after 3 in a row
-            recent_trades = closed_trades[-5:] if closed_trades else []
+            # 2. CHECK consecutive losses - skip 2 days after 3 in a row, then resume
+            recent_trades = closed_trades[-3:] if closed_trades else []
             consecutive_losses = 0
             for t in reversed(recent_trades):
                 if t.pnl < 0:
                     consecutive_losses += 1
                 else:
                     break
-            if consecutive_losses >= 3:
-                # Skip new entries - wait for market conditions to change
-                pass
-            elif len(open_positions) < self.max_trades:
+
+            # Calculate days since last loss
+            days_since_last_trade = 0
+            if closed_trades:
+                last_exit = closed_trades[-1].exit_date or ""
+                days_since_last_trade = sum(1 for d in sim_dates[:i+1] if str(d)[:10] > last_exit)
+
+            # Only pause for 2 days after 3 losses, then resume
+            cooldown_active = consecutive_losses >= 3 and days_since_last_trade < 2
+
+            if not cooldown_active and len(open_positions) < self.max_trades:
                 scored = []
                 for sym, df in all_data.items():
                     # Skip if already have position
