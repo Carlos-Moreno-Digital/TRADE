@@ -48,7 +48,7 @@ Examples:
         "--mode", "-m", type=str, choices=["paper", "live"], default=None,
         help="Trading mode (default: paper)"
     )
-    parser.add_argument("--backtest", type=str, help="Run backtest for symbol")
+    parser.add_argument("--backtest", type=str, nargs="?", const="30", help="Run backtest (number of days, default 30)")
     parser.add_argument("--start", type=str, help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="Backtest end date (YYYY-MM-DD)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -155,17 +155,16 @@ def main() -> None:
     )
 
     if args.backtest:
-        from trade.backtesting.engine import BacktestEngine
-        engine = BacktestEngine(config)
-        result = engine.run(
-            args.backtest,
-            start_date=args.start or "2024-01-01",
-            end_date=args.end or "2024-12-31",
-        )
+        from trade.backtest import Backtester
+
+        bt = Backtester(prop_firm=args.prop_firm, top_n=args.top_n)
+        symbols = [args.symbol] if args.symbol else None
+        days = int(args.backtest) if args.backtest.isdigit() else 30
+        result = bt.run(days=days, symbols=symbols)
+
         if args.json:
             print(json.dumps(result, indent=2, default=str))
-        else:
-            console.print(f"\nBacktest result: {json.dumps(result.get('portfolio', {}), indent=2)}")
+        return
 
     elif args.autonomous:
         _run_autonomous(orchestrator, config)
