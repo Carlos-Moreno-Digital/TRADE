@@ -100,7 +100,7 @@ technical:
 # Sentiment analysis settings
 sentiment:
   enabled: true
-  engine: llm  # llm | finbert | basic
+  engine: basic  # basic | llm | finbert (llm/finbert need API keys)
   sources:
     - news
     - social_media

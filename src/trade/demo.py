@@ -50,7 +50,7 @@ class DemoRunner:
     ):
         self.config = config or load_config()
         self.interval = interval_minutes * 60
-        self.symbols = symbols or ["EURUSD=X", "GBPUSD=X", "XAUUSD=X"]
+        self.symbols = symbols or ["EURUSD=X", "GBPUSD=X", "GC=F"]
 
         # Initialize components
         self.cache = CacheStore()

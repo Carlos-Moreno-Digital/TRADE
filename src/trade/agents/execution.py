@@ -203,9 +203,9 @@ class ExecutionAgent(BaseAgent):
             context, action, decision.strength, decision.confidence,
             reasoning=f"{'EXECUTED' if executed else 'NOT EXECUTED'} [{self.mode}] "
                      f"{decision.action.value} {quantity:.2f} {context.symbol} @ {latest_price:.5f} | "
-                     f"SL: {stop_loss:.5f if stop_loss else 'N/A'} | "
-                     f"TP: {take_profit:.5f if take_profit else 'N/A'} | "
-                     f"R:R: {actual_rr:.2f if stop_loss and take_profit else 'N/A'}",
+                     f"SL: {f'{stop_loss:.5f}' if stop_loss else 'N/A'} | "
+                     f"TP: {f'{take_profit:.5f}' if take_profit else 'N/A'} | "
+                     f"R:R: {f'{actual_rr:.2f}' if (stop_loss and take_profit) else 'N/A'}",
         )
 
         exec_time = (time.time() - start) * 1000
