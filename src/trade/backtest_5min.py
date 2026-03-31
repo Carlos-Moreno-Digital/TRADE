@@ -277,6 +277,271 @@ class ScalpBacktester:
         console.print("\n")
         return self._report(closed, open_pos, max_dd)
 
+    def run_random_samples(self, n_samples: int = 10, symbols: list[str] | None = None) -> dict:
+        """Test strategy on N random 5-day windows from 2 years of 1H data."""
+        import random
+
+        if symbols is None:
+            symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X",
+                       "USDCAD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X"]
+
+        console.print(Panel.fit(
+            f"[bold magenta]Random Sample Validation - {n_samples} Random Periods[/bold magenta]\n"
+            f"Downloads 2 years of 1H data, picks {n_samples} random 5-day windows\n"
+            f"Tests scalping strategy on each to validate consistency",
+            title="Monte Carlo Validation",
+            border_style="magenta",
+        ))
+
+        # Download 1H data (yfinance gives ~730 days at 1H)
+        console.print(f"[dim]Downloading 1H data (2 years) for {len(symbols)} pairs...[/dim]")
+        hourly_data = {}
+        for sym in symbols:
+            try:
+                df = self.provider.get_historical(sym, period="2y", interval="1h")
+                if not df.empty and len(df) >= 500:
+                    hourly_data[sym] = df
+            except Exception:
+                pass
+        console.print(f"  Got {len(hourly_data)}/{len(symbols)} symbols\n")
+
+        if not hourly_data:
+            console.print("[red]No 1H data available[/red]")
+            return {"error": "No data"}
+
+        # Get all available dates
+        ref = next(iter(hourly_data.values()))
+        all_dates = sorted(set(str(d)[:10] for d in ref.index.tolist()))
+
+        # Need at least warmup + 5 trading days
+        if len(all_dates) < 60:
+            console.print("[red]Not enough historical dates[/red]")
+            return {"error": "Insufficient data"}
+
+        # Pick N random start dates (leaving room for 5-day window + warmup)
+        valid_starts = all_dates[50:-10]  # Skip first 50 (warmup) and last 10
+        if len(valid_starts) < n_samples:
+            n_samples = len(valid_starts)
+
+        sample_starts = sorted(random.sample(valid_starts, n_samples))
+
+        console.print(f"Testing {n_samples} random 5-day periods:\n")
+
+        results = []
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
+        total_pnl = 0.0
+
+        for idx, start_date in enumerate(sample_starts):
+            # Get 5 trading days of data starting from this date
+            start_idx = all_dates.index(start_date)
+            end_date = all_dates[min(start_idx + 7, len(all_dates) - 1)]  # ~5 trading days
+
+            # Slice data for this window (including warmup before)
+            warmup_date = all_dates[max(start_idx - 50, 0)]
+
+            window_data = {}
+            for sym, df in hourly_data.items():
+                mask = (df.index >= pd.Timestamp(warmup_date)) & (df.index <= pd.Timestamp(end_date + " 23:59"))
+                sliced = df[mask]
+                if len(sliced) >= 50:
+                    window_data[sym] = sliced
+
+            if not window_data:
+                continue
+
+            # Run the scalp strategy on this window
+            # Reset state
+            cash = self.account_size
+            equity = self.account_size
+            peak = self.account_size
+            open_pos = []
+            closed = []
+            max_dd = 0.0
+            trades_today = 0
+            current_day = ""
+
+            ref_w = next(iter(window_data.values()))
+            timestamps = sorted(ref_w.index.tolist())
+            warmup_candles = 50
+
+            for i in range(warmup_candles, len(timestamps)):
+                ts = timestamps[i]
+                ts_str = str(ts)
+                day = ts_str[:10]
+                hour = ts.hour if hasattr(ts, 'hour') else 12
+
+                if day < start_date:
+                    continue  # Still in warmup
+
+                if day != current_day:
+                    trades_today = 0
+                    current_day = day
+
+                if not (7 <= hour <= 16):
+                    continue
+
+                # Check SL/TP
+                to_close = []
+                for pos in open_pos:
+                    df = window_data.get(pos.symbol)
+                    if df is None:
+                        continue
+                    mask = df.index <= ts
+                    if mask.sum() == 0:
+                        continue
+                    c = df[mask].iloc[-1]
+                    h, l, cp = float(c["high"]), float(c["low"]), float(c["close"])
+                    spread = SCALP_SPREADS.get(pos.symbol, 0.0002)
+                    slip = spread * SLIPPAGE
+
+                    if pos.side == "buy":
+                        if l <= pos.stop_loss:
+                            pos.exit_price = pos.stop_loss - slip
+                            pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
+                            pos.exit_reason = "SL"
+                            to_close.append(pos)
+                        elif h >= pos.take_profit:
+                            pos.exit_price = pos.take_profit - slip
+                            pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
+                            pos.exit_reason = "TP"
+                            to_close.append(pos)
+                    else:
+                        if h >= pos.stop_loss:
+                            pos.exit_price = pos.stop_loss + slip
+                            pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
+                            pos.exit_reason = "SL"
+                            to_close.append(pos)
+                        elif l <= pos.take_profit:
+                            pos.exit_price = pos.take_profit + slip
+                            pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
+                            pos.exit_reason = "TP"
+                            to_close.append(pos)
+
+                for pos in to_close:
+                    margin = pos.entry_price * pos.quantity * 0.01
+                    cash += margin + pos.pnl
+                    open_pos.remove(pos)
+                    closed.append(pos)
+
+                # New entries
+                if len(open_pos) < self.max_trades and trades_today < self.max_trades_per_day:
+                    for sym, df in window_data.items():
+                        if len(open_pos) >= self.max_trades:
+                            break
+                        if any(p.symbol == sym for p in open_pos):
+                            continue
+                        mask = df.index <= ts
+                        sl = df[mask]
+                        if len(sl) < 50:
+                            continue
+                        signal = self._scalp_signal(sl, sym)
+                        if signal is None:
+                            continue
+
+                        entry = signal["price"]
+                        risk_dist = abs(entry - signal["sl"])
+                        if risk_dist <= 0:
+                            continue
+                        risk_amt = self.account_size * self.risk_per_trade
+                        qty = risk_amt / risk_dist
+                        max_qty = self.account_size * 5 / entry if entry > 0 else 0
+                        qty = min(qty, max_qty)
+
+                        spread = SCALP_SPREADS.get(sym, 0.0002)
+                        slip = spread * SLIPPAGE
+                        fill = entry + spread/2 + slip if signal["action"] == "buy" else entry - spread/2 - slip
+
+                        pos = ScalpPosition(sym, signal["action"], fill, round(qty, 4),
+                                            signal["sl"], signal["tp"], ts_str)
+                        margin = fill * qty * 0.01
+                        cash -= margin
+                        open_pos.append(pos)
+                        trades_today += 1
+
+                # Equity
+                unrealized = sum(
+                    ((float(window_data[p.symbol][window_data[p.symbol].index <= ts].iloc[-1]["close"]) - p.entry_price) * p.quantity
+                     if p.side == "buy" else
+                     (p.entry_price - float(window_data[p.symbol][window_data[p.symbol].index <= ts].iloc[-1]["close"])) * p.quantity)
+                    for p in open_pos if p.symbol in window_data and window_data[p.symbol].index[window_data[p.symbol].index <= ts].shape[0] > 0
+                ) if open_pos else 0
+
+                margin_held = sum(p.entry_price * p.quantity * 0.01 for p in open_pos)
+                equity = cash + margin_held + unrealized
+                if equity > peak:
+                    peak = equity
+                dd = (peak - equity) / peak * 100 if peak > 0 else 0
+                max_dd = max(max_dd, min(dd, 100))
+
+            # Close remaining
+            for pos in open_pos:
+                margin = pos.entry_price * pos.quantity * 0.01
+                cash += margin
+
+            # Calculate result for this window
+            w = sum(1 for t in closed if t.pnl > 0)
+            l_count = sum(1 for t in closed if t.pnl <= 0)
+            pnl = sum(t.pnl for t in closed)
+            pnl_pct = pnl / self.account_size * 100
+
+            total_trades += len(closed)
+            total_wins += w
+            total_losses += l_count
+            total_pnl += pnl
+
+            pc = "green" if pnl >= 0 else "red"
+            wr = w / len(closed) * 100 if closed else 0
+            console.print(
+                f"  [{idx+1:2d}/{n_samples}] {start_date} → {end_date} | "
+                f"{len(closed):3d} trades | W:{w} L:{l_count} ({wr:.0f}%) | "
+                f"[{pc}]${pnl:+.2f} ({pnl_pct:+.1f}%)[/{pc}] | DD:{max_dd:.1f}%"
+            )
+
+            results.append({
+                "start": start_date, "end": end_date,
+                "trades": len(closed), "wins": w, "losses": l_count,
+                "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2),
+                "win_rate": round(wr, 1), "max_dd": round(min(max_dd, 100), 2),
+            })
+
+        # Summary
+        console.print(f"\n{'='*70}")
+        profitable = sum(1 for r in results if r["pnl"] > 0)
+        avg_pnl = total_pnl / n_samples if n_samples > 0 else 0
+        overall_wr = total_wins / max(1, total_wins + total_losses) * 100
+
+        console.print(Panel.fit(
+            f"[bold]Monte Carlo Summary - {n_samples} Random Periods[/bold]",
+            border_style="magenta",
+        ))
+
+        st = Table(show_header=False, box=None)
+        st.add_column("", style="bold", width=28)
+        st.add_column("", width=25)
+        st.add_row("Profitable Periods", f"{profitable}/{n_samples} ({profitable/max(1,n_samples)*100:.0f}%)")
+        st.add_row("Total Trades", str(total_trades))
+        st.add_row("Overall Win Rate", f"{overall_wr:.1f}%")
+        pc = "green" if total_pnl >= 0 else "red"
+        st.add_row("Total P&L (all periods)", f"[{pc}]${total_pnl:+,.2f}[/{pc}]")
+        st.add_row("Avg P&L per 5-day period", f"[{pc}]${avg_pnl:+,.2f} ({avg_pnl/self.account_size*100:+.2f}%)[/{pc}]")
+        monthly_proj = avg_pnl * (22 / 5)
+        mp = "green" if monthly_proj >= 0 else "red"
+        st.add_row("Projected Monthly P&L", f"[{mp}]${monthly_proj:+,.0f} ({monthly_proj/self.account_size*100:+.1f}%)[/{mp}]")
+        st.add_row("", "")
+        pace_ok = monthly_proj / self.account_size * 100 >= 10
+        st.add_row("10% Challenge Pace?", f"[{'green bold' if pace_ok else 'red'}]{'YES' if pace_ok else 'NO'}[/{'green bold' if pace_ok else 'red'}]")
+        console.print(st)
+
+        return {
+            "samples": n_samples, "profitable": profitable,
+            "total_trades": total_trades, "win_rate": round(overall_wr, 1),
+            "total_pnl": round(total_pnl, 2), "avg_pnl": round(avg_pnl, 2),
+            "monthly_projected": round(monthly_proj, 2),
+            "results": results,
+        }
+
     def _scalp_signal(self, df: pd.DataFrame, symbol: str) -> dict | None:
         """5-minute scalping: momentum + mean reversion hybrid."""
         try:

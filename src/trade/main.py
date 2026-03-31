@@ -64,6 +64,7 @@ Examples:
 
     # Scalp backtest
     parser.add_argument("--scalp", action="store_true", help="Run 5-minute scalping backtest")
+    parser.add_argument("--scalp-validate", action="store_true", help="Validate scalp on 10 random dates from 2 years")
 
     # Scanner
     parser.add_argument("--top-n", type=int, default=3, help="Number of top candidates to deep analyze (default: 3)")
@@ -135,6 +136,14 @@ def main() -> None:
     # =========================================================================
     # SCALP BACKTEST MODE
     # =========================================================================
+    if args.scalp_validate:
+        from trade.backtest_5min import ScalpBacktester
+        bt = ScalpBacktester(account_size=10000)
+        result = bt.run_random_samples(n_samples=10)
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        return
+
     if args.scalp:
         from trade.backtest_5min import ScalpBacktester
         bt = ScalpBacktester(account_size=10000)
