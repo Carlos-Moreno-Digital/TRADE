@@ -262,65 +262,120 @@ class ScalpBacktester:
         return self._report(closed, open_pos, max_dd)
 
     def _scalp_signal(self, df: pd.DataFrame, symbol: str) -> dict | None:
-        """5-minute scalping signal: EMA crossover + RSI + ATR."""
+        """5-minute scalping: momentum + mean reversion hybrid."""
         try:
             close = df["close"].values.astype(float)
             high = df["high"].values.astype(float)
             low = df["low"].values.astype(float)
-            vol = df["volume"].values.astype(float) if "volume" in df.columns else None
 
             latest = float(close[-1])
             if math.isnan(latest) or latest <= 0:
                 return None
 
-            # Fast scalping indicators
-            ema8 = talib.EMA(close, timeperiod=8)
-            ema21 = talib.EMA(close, timeperiod=21)
+            # Ultra-fast scalping indicators
+            ema5 = talib.EMA(close, timeperiod=5)
+            ema13 = talib.EMA(close, timeperiod=13)
+            ema50 = talib.EMA(close, timeperiod=50)
             rsi = talib.RSI(close, timeperiod=7)
             atr = talib.ATR(high, low, close, timeperiod=10)
             macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=5, slowperiod=13, signalperiod=4)
+            upper, middle, lower_bb = talib.BBANDS(close, timeperiod=14, nbdevup=2, nbdevdn=2)
+            stoch_k, stoch_d = talib.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowd_period=3)
 
-            ema8_now = float(ema8[-1]) if not math.isnan(ema8[-1]) else latest
-            ema8_prev = float(ema8[-2]) if not math.isnan(ema8[-2]) else latest
-            ema21_now = float(ema21[-1]) if not math.isnan(ema21[-1]) else latest
-            ema21_prev = float(ema21[-2]) if not math.isnan(ema21[-2]) else latest
+            ema5_now = float(ema5[-1]) if not math.isnan(ema5[-1]) else latest
+            ema13_now = float(ema13[-1]) if not math.isnan(ema13[-1]) else latest
+            ema50_now = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
             rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.001
             macd_val = float(macd_hist[-1]) if not math.isnan(macd_hist[-1]) else 0
+            macd_prev = float(macd_hist[-2]) if len(macd_hist) > 1 and not math.isnan(macd_hist[-2]) else 0
+            bb_up = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.01
+            bb_lo = float(lower_bb[-1]) if not math.isnan(lower_bb[-1]) else latest * 0.99
+            stoch = float(stoch_k[-1]) if not math.isnan(stoch_k[-1]) else 50
 
             if atr_val <= 0:
                 return None
 
-            # Volume filter (if available)
-            vol_ok = True
-            if vol is not None and len(vol) >= 20:
-                avg_vol = float(np.nanmean(vol[-20:]))
-                curr_vol = float(vol[-1])
-                vol_ok = curr_vol > avg_vol * 0.8  # At least 80% of avg volume
+            # Trend direction from EMA50
+            trend = "up" if latest > ema50_now else "down"
 
-            if not vol_ok:
-                return None
+            # === MULTI-SIGNAL SCORING (not just crossover) ===
+            bull = 0
+            bear = 0
 
-            # === CROSSOVER DETECTION ===
-            bullish_cross = ema8_prev <= ema21_prev and ema8_now > ema21_now
-            bearish_cross = ema8_prev >= ema21_prev and ema8_now < ema21_now
+            # 1. EMA alignment (fast above slow = bullish momentum)
+            if ema5_now > ema13_now:
+                bull += 1
+            else:
+                bear += 1
 
+            # 2. Price position vs EMA50 (trend context)
+            if latest > ema50_now:
+                bull += 1
+            else:
+                bear += 1
+
+            # 3. RSI zones (adjusted for 5min - wider zones)
+            if rsi_val < 30:
+                bull += 2  # Oversold bounce
+            elif rsi_val < 40:
+                bull += 1
+            if rsi_val > 70:
+                bear += 2  # Overbought fade
+            elif rsi_val > 60:
+                bear += 1
+
+            # 4. MACD momentum flip (most important for 5min)
+            if macd_prev <= 0 < macd_val:
+                bull += 2  # Just flipped bullish
+            if macd_prev >= 0 > macd_val:
+                bear += 2  # Just flipped bearish
+            elif macd_val > 0:
+                bull += 1
+            elif macd_val < 0:
+                bear += 1
+
+            # 5. Bollinger Band touch (mean reversion)
+            if latest <= bb_lo:
+                bull += 2  # At lower band
+            if latest >= bb_up:
+                bear += 2  # At upper band
+
+            # 6. Stochastic extremes
+            if stoch < 20:
+                bull += 1
+            if stoch > 80:
+                bear += 1
+
+            # 7. 3-candle momentum
+            if len(close) >= 3:
+                mom3 = (latest - float(close[-3])) / float(close[-3]) * 100
+                if mom3 > 0.05:
+                    bull += 1
+                elif mom3 < -0.05:
+                    bear += 1
+
+            # === DECISION: need 3+ score with trend alignment ===
             action = None
+            net = bull - bear
 
-            # BUY: EMA8 crosses above EMA21 + RSI > 45 + MACD positive
-            if bullish_cross and rsi_val > 45 and rsi_val < 75 and macd_val > 0:
+            # With trend (safer)
+            if trend == "up" and net >= 3 and bull >= 4:
                 action = "buy"
-
-            # SELL: EMA8 crosses below EMA21 + RSI < 55 + MACD negative
-            elif bearish_cross and rsi_val < 55 and rsi_val > 25 and macd_val < 0:
+            elif trend == "down" and net <= -3 and bear >= 4:
+                action = "sell"
+            # Counter-trend only on extreme signals (mean reversion)
+            elif net >= 5 and bull >= 5:
+                action = "buy"
+            elif net <= -5 and bear >= 5:
                 action = "sell"
 
             if action is None:
                 return None
 
-            # SL/TP: ATR-based (tight for scalping)
-            sl_mult = 1.0   # 1x ATR stop loss
-            tp_mult = 2.0   # 2x ATR take profit (2:1 R:R)
+            # SL/TP for scalping: tight and fast
+            sl_mult = 1.0
+            tp_mult = 1.8  # Slightly less than 2:1 for more TP hits
 
             if action == "buy":
                 sl = latest - atr_val * sl_mult
@@ -332,7 +387,7 @@ class ScalpBacktester:
             return {
                 "symbol": symbol, "action": action, "price": latest,
                 "sl": round(sl, 5), "tp": round(tp, 5), "atr": atr_val,
-                "rsi": rsi_val,
+                "rsi": rsi_val, "bull": bull, "bear": bear,
             }
         except Exception:
             return None
