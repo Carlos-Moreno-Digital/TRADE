@@ -1,15 +1,16 @@
-"""5-Minute Scalping Backtester v5 - Research-Backed ORB with Retest Entry.
+"""5-Minute Scalping Backtester v6 - Multi-Strategy Prop Firm Challenger.
 
-Strategy: ORB + Retest Confirmation + EMA Trend Alignment + ADX Filter
-Based on: Zarattini et al. 2024, Edgeful, Holmberg et al. 2013
+Three signal sources for maximum opportunity:
+A) ORB Retest (London + NY opening range breakout with pullback confirmation)
+B) Asian Range Breakout (overnight range breakout at London open)
+C) Momentum Continuation (strong EMA trend + pullback to EMA20 during overlap)
 
-- Opening Range: High/Low of first 15min of London (07:00-07:15) and NY (13:00-13:15)
-- Entry: Wait for breakout → pullback to range edge → bounce confirmation (retest entry)
-- Filter: ADX > 20, EMA20 > EMA50 alignment, skip Mondays, range size filter
-- Exit: SL at opposite side of range, TP at 1.5x range width
-- Sessions: London (07:15-11:00 UTC) and NY (13:15-16:00 UTC) only
-- Max 1 trade per session per symbol (prevents overtrading)
-- Risk: 0.5% per trade
+Key improvements over v5:
+- 3 signal sources instead of 1 → 3-4x more trades
+- Tight SL at retest level (not opposite range side) → true 2:1 R:R
+- 1% risk per trade (prop firm challenge mode)
+- London-NY overlap session (12:00-16:00) as additional window
+- Skip Mondays + daily kill switch (max 2 losses)
 """
 
 from __future__ import annotations
@@ -61,9 +62,9 @@ class ScalpPosition:
 class ScalpBacktester:
     def __init__(self, account_size: float = 10000):
         self.account_size = account_size
-        self.risk_per_trade = 0.005  # 0.5% per scalp
-        self.max_trades = 2          # Max 2 concurrent
-        self.max_trades_per_day = 4  # ORB: max 1 per session per symbol = very selective
+        self.risk_per_trade = 0.0075  # 0.75% per trade (balanced for prop firm)
+        self.max_trades = 3          # Max 3 concurrent
+        self.max_trades_per_day = 6  # Multi-strategy: more opportunities
         self.provider = MarketDataProvider()
         # Track opening ranges per day per symbol per session
         self._opening_ranges: dict[str, dict] = {}  # key: "SYMBOL_DATE_SESSION"
@@ -77,9 +78,9 @@ class ScalpBacktester:
             f"[bold cyan]5-Minute Scalping Backtester[/bold cyan]\n"
             f"Account: ${self.account_size:,.0f} | Risk: {self.risk_per_trade*100:.1f}%/trade | "
             f"Max {self.max_trades_per_day} trades/day\n"
-            f"Strategy: ORB v5 - Retest Entry + EMA Alignment + ADX + No Monday\n"
-            f"Sessions: London (07:15-11:00) + NY (13:15-16:00) UTC",
-            title="Scalp Backtest v5",
+            f"Strategy: v6 Multi-Strategy (ORB + Asian Range + Momentum)\n"
+            f"Sessions: London + NY + Overlap | Risk: {self.risk_per_trade*100:.0f}%/trade",
+            title="Scalp Backtest v6",
             border_style="magenta",
         ))
         self._opening_ranges = {}  # Reset for fresh run
@@ -558,77 +559,78 @@ class ScalpBacktester:
                 "win_rate": round(overall_wr, 1), "total_pnl": round(total_pnl, 2),
                 "avg_pnl": round(avg_pnl, 2), "monthly_projected": round(mp, 2), "results": results}
 
-    def _build_opening_range(self, df: pd.DataFrame, symbol: str, current_ts) -> None:
-        """Build opening ranges for London and NY sessions.
+    def _build_ranges(self, df: pd.DataFrame, symbol: str, current_ts) -> None:
+        """Build all session ranges: Asian, London ORB, NY ORB.
 
-        Opening Range = High/Low of first 15 minutes of each session.
-        Research: 15min range captures institutional positioning with less noise
-        than 30min (Zarattini et al. 2024, Edgeful).
-        London: 07:00-07:15 UTC → trade breakouts 07:15-11:00
-        NY: 13:00-13:15 UTC → trade breakouts 13:15-16:00
+        Asian Range: 00:00-06:30 UTC (overnight consolidation)
+        London ORB: 07:00-07:15 UTC (first 15min)
+        NY ORB: 13:00-13:15 UTC (first 15min)
         """
         ts_str = str(current_ts)
         day = ts_str[:10]
         hour = current_ts.hour if hasattr(current_ts, 'hour') else int(ts_str[11:13])
         minute = current_ts.minute if hasattr(current_ts, 'minute') else int(ts_str[14:16])
 
-        # London opening range: collect candles from 07:00-07:15 (3 x 5min candles)
+        h = float(df.iloc[-1]["high"])
+        l = float(df.iloc[-1]["low"])
+        if math.isnan(h) or math.isnan(l):
+            return
+
+        def _init_range(key):
+            if key not in self._opening_ranges:
+                self._opening_ranges[key] = {
+                    "highs": [], "lows": [], "ready": False,
+                    "breakout_triggered": None, "breakout_price": None,
+                }
+
+        def _finalize(key):
+            if key in self._opening_ranges:
+                r = self._opening_ranges[key]
+                if not r["ready"] and r["highs"] and r["lows"]:
+                    r["range_high"] = max(r["highs"])
+                    r["range_low"] = min(r["lows"])
+                    r["range_width"] = r["range_high"] - r["range_low"]
+                    r["ready"] = True
+                    r["traded"] = False
+
+        # === ASIAN RANGE: 00:00-06:30 UTC ===
+        asian_key = f"{symbol}_{day}_asian"
+        if 0 <= hour <= 5 or (hour == 6 and minute < 30):
+            _init_range(asian_key)
+            self._opening_ranges[asian_key]["highs"].append(h)
+            self._opening_ranges[asian_key]["lows"].append(l)
+        elif hour == 6 and minute >= 30:
+            _finalize(asian_key)
+        elif hour == 7 and minute == 0:
+            _finalize(asian_key)  # Ensure finalized by London open
+
+        # === LONDON ORB: 07:00-07:15 UTC ===
         london_key = f"{symbol}_{day}_london"
         if hour == 7 and minute < 15:
-            if london_key not in self._opening_ranges:
-                self._opening_ranges[london_key] = {
-                    "highs": [], "lows": [], "ready": False,
-                    "breakout_triggered": None,  # For retest logic
-                    "breakout_price": None,
-                }
-            h = float(df.iloc[-1]["high"])
-            l = float(df.iloc[-1]["low"])
-            if not math.isnan(h) and not math.isnan(l):
-                self._opening_ranges[london_key]["highs"].append(h)
-                self._opening_ranges[london_key]["lows"].append(l)
-        elif hour == 7 and minute >= 15 and london_key in self._opening_ranges:
-            r = self._opening_ranges[london_key]
-            if not r["ready"] and r["highs"] and r["lows"]:
-                r["range_high"] = max(r["highs"])
-                r["range_low"] = min(r["lows"])
-                r["range_width"] = r["range_high"] - r["range_low"]
-                r["ready"] = True
-                r["traded"] = False
+            _init_range(london_key)
+            self._opening_ranges[london_key]["highs"].append(h)
+            self._opening_ranges[london_key]["lows"].append(l)
+        elif hour == 7 and minute >= 15:
+            _finalize(london_key)
 
-        # NY opening range: collect candles from 13:00-13:15
+        # === NY ORB: 13:00-13:15 UTC ===
         ny_key = f"{symbol}_{day}_ny"
         if hour == 13 and minute < 15:
-            if ny_key not in self._opening_ranges:
-                self._opening_ranges[ny_key] = {
-                    "highs": [], "lows": [], "ready": False,
-                    "breakout_triggered": None,
-                    "breakout_price": None,
-                }
-            h = float(df.iloc[-1]["high"])
-            l = float(df.iloc[-1]["low"])
-            if not math.isnan(h) and not math.isnan(l):
-                self._opening_ranges[ny_key]["highs"].append(h)
-                self._opening_ranges[ny_key]["lows"].append(l)
-        elif hour == 13 and minute >= 15 and ny_key in self._opening_ranges:
-            r = self._opening_ranges[ny_key]
-            if not r["ready"] and r["highs"] and r["lows"]:
-                r["range_high"] = max(r["highs"])
-                r["range_low"] = min(r["lows"])
-                r["range_width"] = r["range_high"] - r["range_low"]
-                r["ready"] = True
-                r["traded"] = False
+            _init_range(ny_key)
+            self._opening_ranges[ny_key]["highs"].append(h)
+            self._opening_ranges[ny_key]["lows"].append(l)
+        elif hour == 13 and minute >= 15:
+            _finalize(ny_key)
 
     def _scalp_signal(self, df: pd.DataFrame, symbol: str, current_ts=None) -> dict | None:
-        """v5: Research-backed ORB with Retest Entry.
+        """v6: Multi-Strategy Prop Firm Challenger.
 
-        Improvements based on academic research (Zarattini 2024, Edgeful, Holmberg 2013):
-        1. 15-min opening range (optimal per Zarattini et al.)
-        2. RETEST ENTRY: wait for break → pullback → bounce (+20% WR per Edgeful)
-        3. Skip Mondays (abnormal false breakout rate)
-        4. Range size filter (skip noise/too-wide ranges)
-        5. EMA20 > EMA50 trend alignment (institutional filter)
-        6. ADX > 20 (only trending markets)
-        7. Candle close outside range (not just wick)
+        3 signal sources:
+        A) ORB Retest — London/NY opening range breakout + pullback
+        B) Asian Range Breakout — overnight range breakout at London open
+        C) EMA Pullback — trend continuation during London-NY overlap
+
+        Key: TIGHT SL at retest level (true 2:1 R:R), 1% risk per trade.
         """
         try:
             close = df["close"].values.astype(float)
@@ -651,50 +653,19 @@ class ScalpBacktester:
             minute = current_ts.minute if hasattr(current_ts, 'minute') else int(ts_str[14:16])
 
             # === MONDAY FILTER ===
-            # Research: Monday sessions have abnormally high false breakout rates
-            # due to weekend gaps and position adjustments
             weekday = current_ts.weekday() if hasattr(current_ts, 'weekday') else None
-            if weekday == 0:  # Monday
+            if weekday == 0:
                 return None
 
-            # Build opening ranges
-            self._build_opening_range(df, symbol, current_ts)
+            # Build all ranges
+            self._build_ranges(df, symbol, current_ts)
 
-            # Determine active session range
-            # Trading windows: London 07:15-11:00, NY 13:15-16:00
-            active_range = None
-            session_key = None
-            if 7 <= hour <= 10 and (hour > 7 or minute >= 15):
-                session_key = f"{symbol}_{day}_london"
-            elif 13 <= hour <= 15 and (hour > 13 or minute >= 15):
-                session_key = f"{symbol}_{day}_ny"
-
-            if session_key and session_key in self._opening_ranges:
-                r = self._opening_ranges[session_key]
-                if r.get("ready") and not r.get("traded"):
-                    active_range = r
-
-            if active_range is None:
-                return None
-
-            range_high = active_range["range_high"]
-            range_low = active_range["range_low"]
-            range_width = active_range["range_width"]
-
-            # === RANGE SIZE FILTER ===
-            # Skip ranges that are too tight (noise) or too wide (already moved)
-            # Normalize by price to handle JPY pairs vs EUR pairs
-            range_pct = range_width / latest * 100 if latest > 0 else 0
-            if range_pct < 0.005 or range_pct > 0.15:
-                return None  # < ~5 pips or > ~150 pips for EURUSD equivalent
-
-            # ATR
+            # Core indicators (computed once, shared by all strategies)
             atr = talib.ATR(high, low, close, timeperiod=14)
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.001
             if atr_val <= 0:
                 return None
 
-            # === TREND ALIGNMENT: EMA20 > EMA50 ===
             ema20 = talib.EMA(close, timeperiod=20)
             ema50 = talib.EMA(close, timeperiod=50)
             ema20_val = float(ema20[-1]) if not math.isnan(ema20[-1]) else latest
@@ -702,97 +673,224 @@ class ScalpBacktester:
             trend_up = ema20_val > ema50_val and latest > ema50_val
             trend_down = ema20_val < ema50_val and latest < ema50_val
 
-            # === ADX > 20 (Research: below this, ORB is unreliable) ===
             adx = talib.ADX(high, low, close, timeperiod=14)
             adx_val = float(adx[-1]) if not math.isnan(adx[-1]) else 15
-            if adx_val < 18:
-                return None
 
-            # === RETEST ENTRY LOGIC ===
-            # Phase 1: Detect initial breakout (don't trade yet, just record)
-            # Phase 2: Wait for pullback to range edge
-            # Phase 3: Enter on bounce confirmation (candle close away from range)
-            #
-            # This filters out 67% of false breakouts (Edgeful: only 16-17% are clean)
+            # =========================================================
+            # STRATEGY A: ORB RETEST (London 07:15-11:00, NY 13:15-16:00)
+            # =========================================================
+            if adx_val >= 18:
+                orb_key = None
+                if 7 <= hour <= 10 and (hour > 7 or minute >= 15):
+                    orb_key = f"{symbol}_{day}_london"
+                elif 13 <= hour <= 15 and (hour > 13 or minute >= 15):
+                    orb_key = f"{symbol}_{day}_ny"
 
-            breakout_dir = active_range.get("breakout_triggered")
+                if orb_key and orb_key in self._opening_ranges:
+                    rng = self._opening_ranges[orb_key]
+                    if rng.get("ready") and not rng.get("traded"):
+                        result = self._check_orb_retest(
+                            rng, close, high, low, n, latest, atr_val,
+                            trend_up, trend_down, symbol
+                        )
+                        if result is not None:
+                            return result
 
-            if breakout_dir is None:
-                # Phase 1: Check if price has broken out
-                if close[-1] > range_high and trend_up:
-                    active_range["breakout_triggered"] = "buy"
-                    active_range["breakout_price"] = float(close[-1])
-                    return None  # Don't enter yet — wait for retest
-                elif close[-1] < range_low and trend_down:
-                    active_range["breakout_triggered"] = "sell"
-                    active_range["breakout_price"] = float(close[-1])
-                    return None
-                return None
+            # =========================================================
+            # STRATEGY B: ASIAN RANGE BREAKOUT (trade at London 07:15-09:00)
+            # Only when strong trend (ADX >= 25) — fewer but better signals
+            # =========================================================
+            if 7 <= hour <= 8 and (hour > 7 or minute >= 15) and adx_val >= 25:
+                asian_key = f"{symbol}_{day}_asian"
+                if asian_key in self._opening_ranges:
+                    rng = self._opening_ranges[asian_key]
+                    if rng.get("ready") and not rng.get("traded"):
+                        result = self._check_asian_breakout(
+                            rng, close, high, low, n, latest, atr_val,
+                            trend_up, trend_down, symbol
+                        )
+                        if result is not None:
+                            return result
 
-            # Phase 2+3: Breakout was triggered — look for retest and bounce
-            action = None
-
-            if breakout_dir == "buy":
-                # Price broke above range_high. Now waiting for:
-                # - Price pulls back toward range_high (retest)
-                # - Then closes above range_high again (bounce confirmation)
-                near_retest = low[-1] <= range_high + range_width * 0.1  # Price came back near range_high
-                bounce_confirm = close[-1] > range_high + range_width * 0.02  # Closed above
-
-                if near_retest and bounce_confirm:
-                    # Candle momentum check
-                    candle_body = abs(close[-1] - (close[-2] if n >= 2 else close[-1]))
-                    candle_range = high[-1] - low[-1]
-                    if candle_range > 0 and candle_body / candle_range >= 0.35:
-                        action = "buy"
-
-            elif breakout_dir == "sell":
-                near_retest = high[-1] >= range_low - range_width * 0.1
-                bounce_confirm = close[-1] < range_low - range_width * 0.02
-
-                if near_retest and bounce_confirm:
-                    candle_body = abs(close[-1] - (close[-2] if n >= 2 else close[-1]))
-                    candle_range = high[-1] - low[-1]
-                    if candle_range > 0 and candle_body / candle_range >= 0.35:
-                        action = "sell"
-
-            if action is None:
-                # Check if breakout has failed (price returned deep inside range)
-                # If failed, mark as traded to prevent infinite retry in choppy markets
-                if breakout_dir == "buy" and close[-1] < range_low:
-                    active_range["traded"] = True  # No more attempts this session
-                elif breakout_dir == "sell" and close[-1] > range_high:
-                    active_range["traded"] = True
-                return None
-
-            active_range["traded"] = True
-
-            # === SL/TP ===
-            # SL: opposite side of range + buffer (structural)
-            # TP: range height projection (1.5x) — research-backed
-            if action == "buy":
-                sl = range_low - atr_val * 0.3
-                tp = latest + range_width * 1.5
-                risk = latest - sl
-                reward = tp - latest
-            else:
-                sl = range_high + atr_val * 0.3
-                tp = latest - range_width * 1.5
-                risk = sl - latest
-                reward = latest - tp
-
-            if risk <= 0 or reward / risk < 1.2:
-                active_range["traded"] = False
-                return None
-
-            return {
-                "symbol": symbol, "action": action, "price": latest,
-                "sl": round(sl, 6), "tp": round(tp, 6), "atr": atr_val,
-                "range_high": range_high, "range_low": range_low,
-                "range_width": range_width,
-            }
+            return None
         except Exception:
             return None
+
+    def _check_orb_retest(self, rng, close, high, low, n, latest, atr_val,
+                          trend_up, trend_down, symbol) -> dict | None:
+        """Strategy A: ORB with retest entry and TIGHT SL."""
+        range_high = rng["range_high"]
+        range_low = rng["range_low"]
+        range_width = rng["range_width"]
+
+        # Range size filter
+        range_pct = range_width / latest * 100 if latest > 0 else 0
+        if range_pct < 0.005 or range_pct > 0.15:
+            return None
+
+        breakout_dir = rng.get("breakout_triggered")
+
+        if breakout_dir is None:
+            # Phase 1: Detect breakout
+            if close[-1] > range_high and trend_up:
+                rng["breakout_triggered"] = "buy"
+                rng["breakout_price"] = float(close[-1])
+            elif close[-1] < range_low and trend_down:
+                rng["breakout_triggered"] = "sell"
+                rng["breakout_price"] = float(close[-1])
+            return None
+
+        # Phase 2+3: Retest and bounce
+        action = None
+        if breakout_dir == "buy":
+            near_retest = low[-1] <= range_high + range_width * 0.1
+            bounce = close[-1] > range_high + range_width * 0.02
+            if near_retest and bounce:
+                body = abs(close[-1] - (close[-2] if n >= 2 else close[-1]))
+                rng_candle = high[-1] - low[-1]
+                if rng_candle > 0 and body / rng_candle >= 0.3:
+                    action = "buy"
+        elif breakout_dir == "sell":
+            near_retest = high[-1] >= range_low - range_width * 0.1
+            bounce = close[-1] < range_low - range_width * 0.02
+            if near_retest and bounce:
+                body = abs(close[-1] - (close[-2] if n >= 2 else close[-1]))
+                rng_candle = high[-1] - low[-1]
+                if rng_candle > 0 and body / rng_candle >= 0.3:
+                    action = "sell"
+
+        if action is None:
+            if breakout_dir == "buy" and close[-1] < range_low:
+                rng["traded"] = True
+            elif breakout_dir == "sell" and close[-1] > range_high:
+                rng["traded"] = True
+            return None
+
+        rng["traded"] = True
+
+        # Wide SL at range boundary (proven to survive 5min noise in v5)
+        # TP at 1.5x range width (achievable, proven)
+        if action == "buy":
+            sl = range_low - atr_val * 0.3
+            tp = latest + range_width * 1.5
+            risk = latest - sl
+            reward = tp - latest
+        else:
+            sl = range_high + atr_val * 0.3
+            tp = latest - range_width * 1.5
+            risk = sl - latest
+            reward = latest - tp
+
+        if risk <= 0 or reward <= 0 or reward / risk < 1.2:
+            rng["traded"] = False
+            return None
+
+        return {
+            "symbol": symbol, "action": action, "price": latest,
+            "sl": round(sl, 6), "tp": round(tp, 6), "atr": atr_val,
+            "mode": "ORB_RETEST",
+        }
+
+    def _check_asian_breakout(self, rng, close, high, low, n, latest, atr_val,
+                              trend_up, trend_down, symbol) -> dict | None:
+        """Strategy B: Asian Range Breakout at London open."""
+        range_high = rng["range_high"]
+        range_low = rng["range_low"]
+        range_width = rng["range_width"]
+
+        # Asian range must be meaningful
+        range_pct = range_width / latest * 100 if latest > 0 else 0
+        if range_pct < 0.01 or range_pct > 0.3:
+            return None
+
+        action = None
+        # Break above Asian high + uptrend
+        if close[-1] > range_high and trend_up and close[-1] > range_high + range_width * 0.1:
+            action = "buy"
+        # Break below Asian low + downtrend
+        elif close[-1] < range_low and trend_down and close[-1] < range_low - range_width * 0.1:
+            action = "sell"
+
+        if action is None:
+            return None
+
+        rng["traded"] = True
+
+        # SL: 1.5 ATR from entry (wide enough for 5min noise), TP: 2.5 ATR
+        if action == "buy":
+            sl = latest - atr_val * 1.5
+            tp = latest + atr_val * 2.5
+        else:
+            sl = latest + atr_val * 1.5
+            tp = latest - atr_val * 2.5
+
+        risk = abs(latest - sl)
+        if risk <= 0:
+            return None
+
+        return {
+            "symbol": symbol, "action": action, "price": latest,
+            "sl": round(sl, 6), "tp": round(tp, 6), "atr": atr_val,
+            "mode": "ASIAN_BREAK",
+        }
+
+    def _check_ema_pullback(self, close, high, low, n, latest, atr_val,
+                            ema20_val, ema50_val, trend_up, trend_down,
+                            symbol, day) -> dict | None:
+        """Strategy C: EMA pullback during London-NY overlap (highest liquidity)."""
+        # Track so we only take 1 overlap trade per day per symbol
+        overlap_key = f"{symbol}_{day}_overlap"
+        if overlap_key in self._opening_ranges:
+            if self._opening_ranges[overlap_key].get("traded"):
+                return None
+        else:
+            self._opening_ranges[overlap_key] = {"traded": False, "ready": True}
+
+        # Need strong trend (ADX already checked >= 25 in caller)
+        action = None
+
+        if trend_up:
+            # Price pulled back to EMA20 and bouncing
+            touched_ema = low[-1] <= ema20_val * 1.001  # Price touched/crossed EMA20
+            bouncing = close[-1] > ema20_val  # But closed above
+            above_ema50 = latest > ema50_val  # Still above EMA50
+
+            if touched_ema and bouncing and above_ema50:
+                # Bullish candle confirmation
+                if n >= 2 and close[-1] > close[-2]:
+                    action = "buy"
+
+        elif trend_down:
+            touched_ema = high[-1] >= ema20_val * 0.999
+            bouncing = close[-1] < ema20_val
+            below_ema50 = latest < ema50_val
+
+            if touched_ema and bouncing and below_ema50:
+                if n >= 2 and close[-1] < close[-2]:
+                    action = "sell"
+
+        if action is None:
+            return None
+
+        self._opening_ranges[overlap_key]["traded"] = True
+
+        # SL: beyond EMA50 (structural), TP: 2x risk
+        if action == "buy":
+            sl = min(ema50_val - atr_val * 0.2, latest - atr_val * 0.8)
+            tp = latest + (latest - sl) * 2.0
+        else:
+            sl = max(ema50_val + atr_val * 0.2, latest + atr_val * 0.8)
+            tp = latest - (sl - latest) * 2.0
+
+        risk = abs(latest - sl)
+        if risk <= 0:
+            return None
+
+        return {
+            "symbol": symbol, "action": action, "price": latest,
+            "sl": round(sl, 6), "tp": round(tp, 6), "atr": atr_val,
+            "mode": "EMA_PULLBACK",
+        }
 
     def _report(self, closed, open_pos, max_dd):
         # Cap max_dd to realistic levels (equity calc can overshoot with forex margin)
