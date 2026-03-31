@@ -1,15 +1,12 @@
-"""Real Backtester v2 - Proper historical simulation with no lookahead bias.
+"""Backtester v3 - Professional-grade strategy with regime detection, SMC, correlations.
 
-Key differences from v1:
-- Downloads ALL data upfront, then SLICES it per day (no future data leak)
-- Feeds sliced DataFrames directly to agents (bypasses yfinance calls during sim)
-- Tracks open positions with real price updates each day
-- Simulates SL/TP hits with actual daily high/low prices
-- Properly tracks P&L, drawdown, and win/loss per trade
-
-Usage:
-    python -m trade.main --backtest           # 30 days default
-    python -m trade.main --backtest 60        # 60 days
+Implements 6 phases of improvements:
+1. Higher entry thresholds (quality over quantity)
+2. Regime detection (trending vs ranging - different rules)
+3. Smart Money Concepts (order blocks, FVG, market structure)
+4. Correlation filtering (no duplicate risk)
+5. Dynamic position sizing (compound winners)
+6. Day-of-week bias (avoid bad days)
 """
 
 from __future__ import annotations
@@ -30,14 +27,24 @@ from trade.data.providers import MarketDataProvider
 
 console = Console()
 
+# Correlation pairs that should NOT be traded simultaneously
+CORRELATED_PAIRS = {
+    frozenset(["EURUSD=X", "GBPUSD=X"]): 0.85,
+    frozenset(["EURUSD=X", "USDCHF=X"]): 0.95,
+    frozenset(["AUDUSD=X", "NZDUSD=X"]): 0.90,
+    frozenset(["EURJPY=X", "GBPJPY=X"]): 0.80,
+    frozenset(["AUDJPY=X", "NZDJPY=X"]): 0.85,
+    frozenset(["EURCAD=X", "GBPCAD=X"]): 0.80,
+    frozenset(["EURAUD=X", "GBPAUD=X"]): 0.82,
+    frozenset(["GC=F", "SI=F"]): 0.75,
+}
+
 
 class Position:
-    """A simulated open position."""
-
     def __init__(self, symbol: str, side: str, entry_price: float, quantity: float,
                  stop_loss: float, take_profit: float, entry_date: str):
         self.symbol = symbol
-        self.side = side  # "long" or "short"
+        self.side = side
         self.entry_price = entry_price
         self.quantity = quantity
         self.stop_loss = stop_loss
@@ -50,33 +57,29 @@ class Position:
 
 
 class Backtester:
-    """Proper backtester that slices data per day and simulates real trading."""
-
     def __init__(self, prop_firm: str = "funderpro_classic_10k", top_n: int = 5):
         from trade.risk.prop_firm import load_prop_firm_config
         prop_config = load_prop_firm_config(prop_firm)
         self.account_size = prop_config.account_size
-        self.risk_per_trade = 0.01    # 1% per trade - aggressive but within limits
-        self.max_trades = 4           # Up to 4 concurrent positions
-        self.min_rr = 1.5             # Minimum 1.5:1 risk:reward
+        self.base_risk = 0.01        # 1% base risk per trade
+        self.max_trades = 3          # Max 3 concurrent (less = more focused)
+        self.min_rr = 1.5
         self.top_n = top_n
-
         self.provider = MarketDataProvider()
 
     def run(self, days: int = 30, symbols: list[str] | None = None) -> dict[str, Any]:
-        """Run backtest."""
         if symbols is None:
             symbols = self._get_default_symbols()
 
         console.print(Panel.fit(
-            f"[bold cyan]Backtester v2 - {days} Day Simulation[/bold cyan]\n"
-            f"Account: ${self.account_size:,.0f} | Risk/trade: {self.risk_per_trade*100:.1f}% | "
-            f"R:R min: {self.min_rr} | Max positions: {self.max_trades}",
+            f"[bold cyan]Backtester v3 - {days} Day Pro Simulation[/bold cyan]\n"
+            f"Account: ${self.account_size:,.0f} | Base risk: {self.base_risk*100:.1f}% | "
+            f"R:R min: {self.min_rr} | Max positions: {self.max_trades}\n"
+            f"Features: Regime detection, SMC, Correlations, Compounding, Day bias",
             title="Backtest",
             border_style="cyan",
         ))
 
-        # Download all data upfront
         console.print(f"[dim]Downloading {len(symbols)} symbols...[/dim]")
         all_data = {}
         for sym in symbols:
@@ -91,13 +94,12 @@ class Backtester:
         if not all_data:
             return {"error": "No data"}
 
-        # Get trading days
         ref_df = next(iter(all_data.values()))
         all_dates = sorted(ref_df.index.tolist())
-        warmup = 40  # Need 40 days for indicators
+        warmup = 50
         sim_dates = all_dates[warmup:][-days:]
 
-        # Simulation state
+        # State
         cash = self.account_size
         equity = self.account_size
         peak = self.account_size
@@ -105,13 +107,23 @@ class Backtester:
         closed_trades: list[Position] = []
         daily_equity: list[dict] = []
         max_dd = 0.0
+        consecutive_wins = 0
 
         console.print(f"Simulating {len(sim_dates)} trading days...\n")
 
         for i, date in enumerate(sim_dates):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, 'strftime') else str(date)[:10]
 
-            # 1. CHECK SL/TP + TRAILING STOP on open positions
+            # === PHASE 6: DAY OF WEEK BIAS ===
+            try:
+                day_of_week = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+            except Exception:
+                day_of_week = 2  # Default to Wednesday
+
+            skip_day = day_of_week == 0  # Monday = avoid (range forming)
+            friday = day_of_week == 4    # Friday = smaller size
+
+            # 1. CHECK SL/TP + TRAILING STOP
             positions_to_close = []
             for pos in open_positions:
                 df = all_data.get(pos.symbol)
@@ -125,13 +137,12 @@ class Backtester:
                 low = float(today["low"])
                 close_price = float(today["close"])
 
-                # TRAILING STOP: less aggressive - let winners run
                 risk_dist = abs(pos.entry_price - pos.stop_loss)
+
+                # Trailing stop
                 if pos.side == "long":
-                    # Move SL to breakeven only when price reaches 1.5x risk (not 1x)
                     if close_price >= pos.entry_price + risk_dist * 1.5 and pos.stop_loss < pos.entry_price:
                         pos.stop_loss = pos.entry_price + risk_dist * 0.1
-                    # Trail SL further only at 2x risk
                     if close_price >= pos.entry_price + risk_dist * 2.0 and pos.stop_loss < pos.entry_price + risk_dist * 0.5:
                         pos.stop_loss = pos.entry_price + risk_dist * 0.5
                 elif pos.side == "short":
@@ -140,6 +151,7 @@ class Backtester:
                     if close_price <= pos.entry_price - risk_dist * 2.0 and pos.stop_loss > pos.entry_price - risk_dist * 0.5:
                         pos.stop_loss = pos.entry_price - risk_dist * 0.5
 
+                # SL/TP check
                 if pos.side == "long":
                     if low <= pos.stop_loss:
                         pos.exit_price = pos.stop_loss
@@ -163,28 +175,18 @@ class Backtester:
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
 
-                # TIME-BASED EXIT: only close LOSING trades after 10 days
-                # Winning trades stay open until TP or SL (let winners run)
+                # Time exit: only close LOSERS after 15 days, let winners run
                 if pos not in positions_to_close:
-                    days_held = sum(1 for d in sim_dates[:i+1]
-                                   if str(d)[:10] >= pos.entry_date)
+                    days_held = sum(1 for d in sim_dates[:i+1] if str(d)[:10] >= pos.entry_date)
                     if pos.side == "long":
                         current_pnl = (close_price - pos.entry_price) * pos.quantity
                     else:
                         current_pnl = (pos.entry_price - close_price) * pos.quantity
 
-                    # Close losing/flat trades after 10 days (free up capital)
-                    # Keep winning trades open (let them run to TP)
-                    if days_held >= 10 and current_pnl <= 0:
+                    if days_held >= 15 and current_pnl <= 0:
                         pos.exit_price = close_price
                         pos.pnl = current_pnl
                         pos.exit_reason = "TIME"
-                        positions_to_close.append(pos)
-                    # Close small winners after 12 days (take partial profit)
-                    elif days_held >= 12 and current_pnl > 0:
-                        pos.exit_price = close_price
-                        pos.pnl = current_pnl
-                        pos.exit_reason = "TIME+"
                         positions_to_close.append(pos)
 
             for pos in positions_to_close:
@@ -192,50 +194,71 @@ class Backtester:
                 cash += pos.pnl + (pos.entry_price * pos.quantity if pos.side == "long" else 0)
                 open_positions.remove(pos)
                 closed_trades.append(pos)
-
-            # 2. CHECK consecutive losses - skip 2 days after 3 in a row, then resume
-            recent_trades = closed_trades[-3:] if closed_trades else []
-            consecutive_losses = 0
-            for t in reversed(recent_trades):
-                if t.pnl < 0:
-                    consecutive_losses += 1
+                # Track consecutive wins for compounding
+                if pos.pnl > 0:
+                    consecutive_wins += 1
                 else:
-                    break
+                    consecutive_wins = 0
 
-            # Calculate days since last loss
-            days_since_last_trade = 0
+            # 2. COOLDOWN + DRAWDOWN PROTECTION
+            recent = closed_trades[-3:] if closed_trades else []
+            consec_losses = sum(1 for t in reversed(recent) if t.pnl < 0)
+            if recent and recent[-1].pnl >= 0:
+                consec_losses = 0
+
+            days_since = 0
             if closed_trades:
                 last_exit = closed_trades[-1].exit_date or ""
-                days_since_last_trade = sum(1 for d in sim_dates[:i+1] if str(d)[:10] > last_exit)
+                days_since = sum(1 for d in sim_dates[:i+1] if str(d)[:10] > last_exit)
+            cooldown = consec_losses >= 3 and days_since < 2
 
-            # Only pause for 2 days after 3 losses, then resume
-            cooldown_active = consecutive_losses >= 3 and days_since_last_trade < 2
-
-            # EQUITY DRAWDOWN PROTECTION: reduce risk when giving back profits
             dd_from_peak = (peak - equity) / peak * 100 if peak > 0 else 0
-            risk_multiplier = 1.0
-            if dd_from_peak > 3.0:
-                risk_multiplier = 0.5  # Half size when DD > 3%
+            risk_mult = 1.0
+            if dd_from_peak > 4.0:
+                risk_mult = 0.25  # Quarter size when DD > 4%
+            elif dd_from_peak > 3.0:
+                risk_mult = 0.5
             elif dd_from_peak > 2.0:
-                risk_multiplier = 0.75  # 75% size when DD > 2%
+                risk_mult = 0.75
 
-            if not cooldown_active and len(open_positions) < self.max_trades:
+            # === PHASE 5: COMPOUNDING ===
+            if consecutive_wins >= 3:
+                risk_mult *= 1.5  # 50% more after 3 wins
+            elif consecutive_wins >= 2:
+                risk_mult *= 1.25  # 25% more after 2 wins
+
+            # Friday = reduce size
+            if friday:
+                risk_mult *= 0.75
+
+            # 3. FIND NEW TRADES
+            if not cooldown and not skip_day and len(open_positions) < self.max_trades:
                 scored = []
+                open_syms = [p.symbol for p in open_positions]
+
                 for sym, df in all_data.items():
-                    # Skip if already have position
-                    if any(p.symbol == sym for p in open_positions):
+                    if sym in [p.symbol for p in open_positions]:
+                        continue
+
+                    # === PHASE 4: CORRELATION CHECK ===
+                    correlated = False
+                    for open_sym in open_syms:
+                        pair = frozenset([sym, open_sym])
+                        if pair in CORRELATED_PAIRS and CORRELATED_PAIRS[pair] >= 0.75:
+                            correlated = True
+                            break
+                    if correlated:
                         continue
 
                     mask = df.index <= date
                     df_slice = df[mask]
-                    if len(df_slice) < 40:
+                    if len(df_slice) < 50:
                         continue
 
-                    signal = self._analyze_symbol(df_slice, sym)
+                    signal = self._analyze_symbol(df_slice, sym, day_of_week)
                     if signal and signal["action"] != "hold":
                         scored.append(signal)
 
-                # Sort by confidence, take top N
                 scored.sort(key=lambda s: s["confidence"], reverse=True)
 
                 for signal in scored[:self.top_n - len(open_positions)]:
@@ -250,34 +273,22 @@ class Backtester:
                     if risk_per_unit <= 0:
                         continue
 
-                    # Position size based on risk (adjusted for drawdown)
-                    risk_amount = equity * self.risk_per_trade * risk_multiplier
+                    risk_amount = equity * self.base_risk * risk_mult
                     quantity = risk_amount / risk_per_unit
 
-                    # Check R:R
                     reward = abs(tp - entry_price)
                     rr = reward / risk_per_unit if risk_per_unit > 0 else 0
                     if rr < self.min_rr:
                         continue
 
                     side = "long" if signal["action"] == "buy" else "short"
-
-                    pos = Position(
-                        symbol=signal["symbol"],
-                        side=side,
-                        entry_price=entry_price,
-                        quantity=round(quantity, 4),
-                        stop_loss=sl,
-                        take_profit=tp,
-                        entry_date=date_str,
-                    )
-
+                    pos = Position(signal["symbol"], side, entry_price, round(quantity, 4),
+                                   sl, tp, date_str)
                     if side == "long":
                         cash -= entry_price * quantity
-
                     open_positions.append(pos)
 
-            # 3. UPDATE equity
+            # 4. UPDATE equity
             unrealized = 0
             for pos in open_positions:
                 df = all_data.get(pos.symbol)
@@ -286,11 +297,11 @@ class Backtester:
                 mask = df.index <= date
                 if mask.sum() == 0:
                     continue
-                current_price = float(df[mask].iloc[-1]["close"])
+                cp = float(df[mask].iloc[-1]["close"])
                 if pos.side == "long":
-                    unrealized += (current_price - pos.entry_price) * pos.quantity
+                    unrealized += (cp - pos.entry_price) * pos.quantity
                 else:
-                    unrealized += (pos.entry_price - current_price) * pos.quantity
+                    unrealized += (pos.entry_price - cp) * pos.quantity
 
             equity = cash + sum(
                 pos.entry_price * pos.quantity for pos in open_positions if pos.side == "long"
@@ -302,172 +313,224 @@ class Backtester:
             max_dd = max(max_dd, dd)
 
             daily_equity.append({
-                "date": date_str,
-                "equity": round(equity, 2),
-                "cash": round(cash, 2),
-                "positions": len(open_positions),
+                "date": date_str, "equity": round(equity, 2),
+                "cash": round(cash, 2), "positions": len(open_positions),
                 "unrealized": round(unrealized, 2),
             })
 
-            # Progress
             pct = (i + 1) / len(sim_dates) * 100
-            bar_len = 30
-            filled = int(bar_len * pct / 100)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            trades_str = f"W:{sum(1 for t in closed_trades if t.pnl > 0)} L:{sum(1 for t in closed_trades if t.pnl <= 0)}"
-            console.print(
-                f"\r  [{bar}] {pct:.0f}% | {date_str} | ${equity:,.0f} | "
-                f"Open:{len(open_positions)} | {trades_str}",
-                end="",
-            )
+            filled = int(30 * pct / 100)
+            bar = "█" * filled + "░" * (30 - filled)
+            ts = f"W:{sum(1 for t in closed_trades if t.pnl > 0)} L:{sum(1 for t in closed_trades if t.pnl <= 0)}"
+            console.print(f"\r  [{bar}] {pct:.0f}% | {date_str} | ${equity:,.0f} | Open:{len(open_positions)} | {ts}", end="")
 
         console.print("\n")
-
-        # Generate report
         return self._report(closed_trades, open_positions, daily_equity, max_dd, sim_dates)
 
-    def _analyze_symbol(self, df: pd.DataFrame, symbol: str) -> dict | None:
-        """Analyze a symbol for prop firm trading. More signals, tighter SL/TP."""
+    def _analyze_symbol(self, df: pd.DataFrame, symbol: str, day_of_week: int = 2) -> dict | None:
+        """Professional-grade analysis with regime detection and SMC."""
         try:
             close = df["close"].values.astype(float)
             high = df["high"].values.astype(float)
             low = df["low"].values.astype(float)
 
-            if len(close) < 30:
+            if len(close) < 50:
                 return None
-
             latest = float(close[-1])
             if math.isnan(latest) or latest <= 0:
                 return None
 
             # === INDICATORS ===
             rsi = talib.RSI(close, timeperiod=14)
-            macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+            macd, macd_signal, macd_hist = talib.MACD(close)
             ema9 = talib.EMA(close, timeperiod=9)
             ema21 = talib.EMA(close, timeperiod=21)
             ema50 = talib.EMA(close, timeperiod=50)
             atr = talib.ATR(high, low, close, timeperiod=14)
             adx = talib.ADX(high, low, close, timeperiod=14)
             stoch_k, stoch_d = talib.STOCH(high, low, close)
-            upper, middle, lower = talib.BBANDS(close, timeperiod=20)
+            upper, middle, lower_bb = talib.BBANDS(close, timeperiod=20)
 
             rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
             macd_val = float(macd_hist[-1]) if not math.isnan(macd_hist[-1]) else 0
             macd_prev = float(macd_hist[-2]) if len(macd_hist) > 1 and not math.isnan(macd_hist[-2]) else 0
-            ema9_val = float(ema9[-1]) if not math.isnan(ema9[-1]) else latest
-            ema21_val = float(ema21[-1]) if not math.isnan(ema21[-1]) else latest
-            ema50_val = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
+            ema9_v = float(ema9[-1]) if not math.isnan(ema9[-1]) else latest
+            ema21_v = float(ema21[-1]) if not math.isnan(ema21[-1]) else latest
+            ema50_v = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.02
-            stoch_val = float(stoch_k[-1]) if not math.isnan(stoch_k[-1]) else 50
-            bb_upper = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.02
-            bb_lower = float(lower[-1]) if not math.isnan(lower[-1]) else latest * 0.98
-
             adx_val = float(adx[-1]) if not math.isnan(adx[-1]) else 20
+            stoch_v = float(stoch_k[-1]) if not math.isnan(stoch_k[-1]) else 50
+            bb_up = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.02
+            bb_lo = float(lower_bb[-1]) if not math.isnan(lower_bb[-1]) else latest * 0.98
 
             if atr_val <= 0:
                 return None
 
-            # ADX filter: only trade when trend is strong (ADX > 20)
-            # ADX < 20 = ranging market = avoid
-            if adx_val < 18:
+            # === PHASE 2: REGIME DETECTION ===
+            atr_avg = float(np.nanmean(atr[-20:])) if len(atr) >= 20 else atr_val
+
+            if adx_val > 25 and atr_val > atr_avg:
+                regime = "TRENDING"
+            elif adx_val < 20:
+                regime = "RANGING"
+            else:
+                regime = "TRANSITIONING"
+
+            # Don't trade in transitioning markets
+            if regime == "TRANSITIONING":
                 return None
 
-            # === MAJOR TREND FILTER (THE KEY RULE) ===
-            # Price vs EMA50 determines allowed direction
-            # If price > EMA50: ONLY LONGS (buy pullbacks in uptrend)
-            # If price < EMA50: ONLY SHORTS (sell rallies in downtrend)
-            major_trend = "bullish" if latest > ema50_val else "bearish"
+            # === PHASE 1: ADX FILTER (raised to 22) ===
+            if regime == "TRENDING" and adx_val < 22:
+                return None
 
-            # 20-day momentum for trend confirmation
-            if len(close) >= 20:
-                mom20 = (latest - float(close[-20])) / float(close[-20]) * 100
-            else:
-                mom20 = 0
+            major_trend = "bullish" if latest > ema50_v else "bearish"
 
-            # === SCORING ===
+            # === PHASE 3: SMART MONEY CONCEPTS ===
+            smc_boost = 0
+            try:
+                from trade.analysis.smart_money import get_smc_analysis
+                smc = get_smc_analysis(df)
+                if smc.get("available"):
+                    structure = smc.get("market_structure", "unknown")
+                    active_obs = smc.get("order_blocks", [])
+                    active_fvgs = smc.get("fair_value_gaps", [])
+
+                    # Structure alignment bonus
+                    if structure == "bullish" and major_trend == "bullish":
+                        smc_boost += 2
+                    elif structure == "bearish" and major_trend == "bearish":
+                        smc_boost += 2
+
+                    # Order Block confluence
+                    for ob in active_obs:
+                        ob_low = ob.get("low", 0)
+                        ob_high = ob.get("high", 0)
+                        if ob_low > 0 and abs(latest - ob_low) / latest < 0.005:
+                            if ob.get("type") == "bullish_ob":
+                                smc_boost += 3  # Price at bullish OB = strong buy
+                        if ob_high > 0 and abs(latest - ob_high) / latest < 0.005:
+                            if ob.get("type") == "bearish_ob":
+                                smc_boost += 3
+
+                    # FVG as target confirmation
+                    for fvg in active_fvgs:
+                        if fvg.get("type") == "bullish_fvg" and fvg.get("low", 0) > latest:
+                            smc_boost += 1  # Unfilled FVG above = magnet for price
+                        elif fvg.get("type") == "bearish_fvg" and fvg.get("high", 0) < latest:
+                            smc_boost += 1
+            except Exception:
+                pass
+
+            # === SCORING (regime-adaptive) ===
             bull_score = 0
             bear_score = 0
 
-            # Trend alignment (EMA stack)
-            if ema9_val > ema21_val > ema50_val:
-                bull_score += 3  # Perfect uptrend alignment
-            elif ema9_val > ema21_val:
-                bull_score += 1
-            if ema9_val < ema21_val < ema50_val:
-                bear_score += 3
-            elif ema9_val < ema21_val:
-                bear_score += 1
-
-            # RSI - look for pullbacks within trend, not reversals
-            if major_trend == "bullish":
-                # In uptrend: buy when RSI pulls back to 40-50 (not just oversold)
-                if 35 <= rsi_val <= 50:
-                    bull_score += 2  # Pullback in uptrend = best entry
-                if rsi_val < 35:
-                    bull_score += 1  # Oversold in uptrend
-            else:
-                # In downtrend: sell when RSI bounces to 50-65
-                if 50 <= rsi_val <= 65:
-                    bear_score += 2
-                if rsi_val > 65:
-                    bear_score += 1
-
-            # MACD
-            if macd_val > 0:
-                bull_score += 1
-            if macd_val < 0:
-                bear_score += 1
-            if macd_prev <= 0 < macd_val:
-                bull_score += 2  # Bullish crossover
-            if macd_prev >= 0 > macd_val:
-                bear_score += 2
-
-            # Stochastic - confirming pullback entries
-            if major_trend == "bullish" and stoch_val < 30:
-                bull_score += 1  # Oversold in uptrend
-            if major_trend == "bearish" and stoch_val > 70:
-                bear_score += 1
-
-            # Bollinger
-            if major_trend == "bullish" and latest <= bb_lower:
-                bull_score += 2  # Price hit lower band in uptrend = strong buy
-            if major_trend == "bearish" and latest >= bb_upper:
-                bear_score += 2
-
-            # Short-term momentum (for entry timing)
-            if len(close) >= 3:
-                mom3 = (latest - float(close[-3])) / float(close[-3]) * 100
-                if mom3 > 0.2:
+            if regime == "TRENDING":
+                # TREND FOLLOWING: EMA alignment is king
+                if ema9_v > ema21_v > ema50_v:
+                    bull_score += 4
+                elif ema9_v > ema21_v:
                     bull_score += 1
-                elif mom3 < -0.2:
+                if ema9_v < ema21_v < ema50_v:
+                    bear_score += 4
+                elif ema9_v < ema21_v:
                     bear_score += 1
 
-            # === DECISION (with trend filter) ===
+                # RSI pullbacks in trend
+                if major_trend == "bullish" and 35 <= rsi_val <= 50:
+                    bull_score += 2
+                if major_trend == "bearish" and 50 <= rsi_val <= 65:
+                    bear_score += 2
+
+                # MACD crossover = strong in trends
+                if macd_prev <= 0 < macd_val:
+                    bull_score += 3
+                if macd_prev >= 0 > macd_val:
+                    bear_score += 3
+                elif macd_val > 0:
+                    bull_score += 1
+                elif macd_val < 0:
+                    bear_score += 1
+
+            elif regime == "RANGING":
+                # MEAN REVERSION: Bollinger + RSI extremes
+                if rsi_val > 75:
+                    bear_score += 3
+                elif rsi_val > 65:
+                    bear_score += 1
+                if rsi_val < 25:
+                    bull_score += 3
+                elif rsi_val < 35:
+                    bull_score += 1
+
+                if latest >= bb_up:
+                    bear_score += 3  # At upper band = sell
+                if latest <= bb_lo:
+                    bull_score += 3  # At lower band = buy
+
+                if stoch_v > 80:
+                    bear_score += 2
+                if stoch_v < 20:
+                    bull_score += 2
+
+            # Momentum (both regimes)
+            if len(close) >= 5:
+                mom5 = (latest - float(close[-5])) / float(close[-5]) * 100
+                if mom5 > 0.5:
+                    bull_score += 1
+                elif mom5 < -0.5:
+                    bear_score += 1
+
+            # Add SMC boost
+            if major_trend == "bullish":
+                bull_score += smc_boost
+            else:
+                bear_score += smc_boost
+
+            # === PHASE 6: DAY BIAS ===
+            day_boost = 0
+            if day_of_week in (2, 3):  # Wed/Thu = best trending days
+                day_boost = 1
+            if day_of_week == 1:  # Tuesday = good for reversals
+                if regime == "RANGING":
+                    day_boost = 1
+
+            bull_score += day_boost if bull_score > bear_score else 0
+            bear_score += day_boost if bear_score > bull_score else 0
+
+            # === DECISION (PHASE 1: higher thresholds) ===
             action = "hold"
             confidence = 0.0
             net_score = bull_score - bear_score
 
-            # ONLY trade WITH the major trend (lowered thresholds for more trades)
-            if major_trend == "bullish" and net_score >= 2 and bull_score >= 2:
-                action = "buy"
-                confidence = min(0.9, bull_score * 0.12)
-            elif major_trend == "bearish" and net_score <= -2 and bear_score >= 2:
-                action = "sell"
-                confidence = min(0.9, bear_score * 0.12)
-            # Counter-trend only on extreme signals
-            elif major_trend == "bullish" and net_score <= -4 and bear_score >= 5:
-                action = "sell"
-                confidence = 0.35
-            elif major_trend == "bearish" and net_score >= 4 and bull_score >= 5:
-                action = "buy"
-                confidence = 0.35
+            if regime == "TRENDING":
+                # Require strong confluence in trends
+                if major_trend == "bullish" and net_score >= 3 and bull_score >= 4:
+                    action = "buy"
+                    confidence = min(0.95, bull_score * 0.1)
+                elif major_trend == "bearish" and net_score <= -3 and bear_score >= 4:
+                    action = "sell"
+                    confidence = min(0.95, bear_score * 0.1)
+            elif regime == "RANGING":
+                # Mean reversion needs extreme signals
+                if net_score >= 4 and bull_score >= 5:
+                    action = "buy"
+                    confidence = min(0.85, bull_score * 0.1)
+                elif net_score <= -4 and bear_score >= 5:
+                    action = "sell"
+                    confidence = min(0.85, bear_score * 0.1)
 
             if action == "hold":
                 return None
 
-            # === SL/TP optimized for prop firm ===
-            sl_mult = 1.2   # Tight SL = controlled risk
-            tp_mult = 2.5   # TP at 2.5x risk = good R:R, still achievable
+            # SL/TP based on regime
+            if regime == "TRENDING":
+                sl_mult = 1.2
+                tp_mult = 2.5  # Wider TP in trends (let it run)
+            else:
+                sl_mult = 1.0  # Tighter in ranges
+                tp_mult = 1.8  # Shorter TP in ranges (mean reversion)
 
             if action == "buy":
                 sl = latest - atr_val * sl_mult
@@ -477,30 +540,15 @@ class Backtester:
                 tp = latest - atr_val * tp_mult
 
             return {
-                "symbol": symbol,
-                "action": action,
-                "price": latest,
-                "stop_loss": round(sl, 5),
-                "take_profit": round(tp, 5),
-                "confidence": confidence,
-                "atr": atr_val,
-                "rsi": rsi_val,
-                "bull_score": bull_score,
-                "bear_score": bear_score,
-                "net_score": net_score,
+                "symbol": symbol, "action": action, "price": latest,
+                "stop_loss": round(sl, 5), "take_profit": round(tp, 5),
+                "confidence": confidence, "atr": atr_val, "regime": regime,
+                "bull_score": bull_score, "bear_score": bear_score,
             }
         except Exception:
             return None
 
-    def _report(
-        self,
-        closed: list[Position],
-        open_pos: list[Position],
-        daily_eq: list[dict],
-        max_dd: float,
-        sim_dates: list,
-    ) -> dict:
-        """Generate backtest report."""
+    def _report(self, closed, open_pos, daily_eq, max_dd, sim_dates):
         initial = self.account_size
         final = daily_eq[-1]["equity"] if daily_eq else initial
         total_pnl = final - initial
@@ -517,7 +565,6 @@ class Backtester:
 
         passed = pnl_pct >= 10.0 and max_dd < 10.0
 
-        # Print report
         console.print(Panel.fit(
             f"[bold]Backtest Results - {len(sim_dates)} Trading Days[/bold]",
             border_style="green" if passed else "red",
@@ -549,7 +596,6 @@ class Backtester:
 
         console.print(t)
 
-        # Trade log
         if closed:
             console.print(f"\n[bold]Trade History ({len(closed)} trades)[/bold]")
             tt = Table()
@@ -562,21 +608,16 @@ class Backtester:
             tt.add_column("Reason", width=6)
             tt.add_column("Dates", width=25)
 
-            for i, trade in enumerate(closed, 1):
-                pnl_c = "green" if trade.pnl > 0 else "red"
+            for idx, trade in enumerate(closed, 1):
+                pc = "green" if trade.pnl > 0 else "red"
                 tt.add_row(
-                    str(i),
-                    trade.symbol,
-                    trade.side.upper(),
-                    f"{trade.entry_price:.2f}",
-                    f"{trade.exit_price:.2f}" if trade.exit_price else "OPEN",
-                    f"[{pnl_c}]${trade.pnl:+,.2f}[/{pnl_c}]",
-                    trade.exit_reason or "",
+                    str(idx), trade.symbol, trade.side.upper(),
+                    f"{trade.entry_price:.2f}", f"{trade.exit_price:.2f}" if trade.exit_price else "OPEN",
+                    f"[{pc}]${trade.pnl:+,.2f}[/{pc}]", trade.exit_reason or "",
                     f"{trade.entry_date} → {trade.exit_date or ''}",
                 )
             console.print(tt)
 
-        # Equity curve
         if daily_eq:
             console.print(f"\n[bold]Equity Curve (last 20 days)[/bold]")
             min_eq = min(e["equity"] for e in daily_eq)
@@ -589,38 +630,25 @@ class Backtester:
                 bar = "█" * max(1, bar_len)
                 diff = eq["equity"] - initial
                 color = "green" if diff >= 0 else "red"
-                console.print(
-                    f"  {eq['date']} | ${eq['equity']:>10,.2f} [{color}]({diff:+,.0f})[/{color}] | [{color}]{bar}[/{color}]"
-                )
+                console.print(f"  {eq['date']} | ${eq['equity']:>10,.2f} [{color}]({diff:+,.0f})[/{color}] | [{color}]{bar}[/{color}]")
 
         return {
-            "days": len(sim_dates),
-            "initial": initial,
-            "final": round(final, 2),
-            "pnl": round(total_pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "max_drawdown": round(max_dd, 2),
-            "total_trades": total_trades,
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(win_rate, 1),
-            "avg_win": round(avg_win, 2),
-            "avg_loss": round(avg_loss, 2),
+            "days": len(sim_dates), "initial": initial, "final": round(final, 2),
+            "pnl": round(total_pnl, 2), "pnl_pct": round(pnl_pct, 2),
+            "max_drawdown": round(max_dd, 2), "total_trades": total_trades,
+            "wins": len(wins), "losses": len(losses), "win_rate": round(win_rate, 1),
+            "avg_win": round(avg_win, 2), "avg_loss": round(avg_loss, 2),
             "profit_factor": round(profit_factor, 2) if profit_factor < 999 else 999,
             "passed": passed,
         }
 
     def _get_default_symbols(self) -> list[str]:
         return [
-            # Forex majors
             "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDCHF=X",
-            # Forex crosses - more opportunities
             "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X", "EURAUD=X", "EURCAD=X", "EURCHF=X",
             "GBPAUD=X", "GBPNZD=X", "GBPCAD=X", "GBPCHF=X",
             "AUDJPY=X", "NZDJPY=X", "CADJPY=X", "CHFJPY=X",
             "AUDNZD=X", "AUDCAD=X",
-            # Commodities
             "GC=F", "SI=F", "CL=F", "PL=F",
-            # Crypto
             "BTC-USD", "ETH-USD",
         ]
