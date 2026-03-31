@@ -102,24 +102,45 @@ class Backtester:
             border_style="cyan",
         ))
 
-        console.print(f"[dim]Downloading {len(symbols)} symbols...[/dim]")
-        all_data = {}
+        # Download both daily (for trend) and 1H (for entries)
+        console.print(f"[dim]Downloading {len(symbols)} symbols (daily + 1H)...[/dim]")
+        daily_data = {}
+        hourly_data = {}
         for sym in symbols:
             try:
-                df = self.provider.get_historical(sym, period="6mo", interval="1d")
-                if not df.empty and len(df) >= 50:
-                    all_data[sym] = df
+                df_d = self.provider.get_historical(sym, period="6mo", interval="1d")
+                if not df_d.empty and len(df_d) >= 50:
+                    daily_data[sym] = df_d
+                # 1H data: yfinance gives max 730 hours (~1 month)
+                df_h = self.provider.get_historical(sym, period="1mo", interval="1h")
+                if not df_h.empty and len(df_h) >= 50:
+                    hourly_data[sym] = df_h
             except Exception:
                 pass
-        console.print(f"  Got data for {len(all_data)}/{len(symbols)} symbols\n")
+        console.print(f"  Daily: {len(daily_data)}/{len(symbols)} | 1H: {len(hourly_data)}/{len(symbols)}\n")
 
+        all_data = daily_data  # Keep daily for backward compat
         if not all_data:
             return {"error": "No data"}
 
-        ref_df = next(iter(all_data.values()))
-        all_dates = sorted(ref_df.index.tolist())
-        warmup = 50
-        sim_dates = all_dates[warmup:][-days:]
+        # Build simulation timeline from 1H data if available, else daily
+        if hourly_data:
+            # Use 1H candles as simulation points (multiple per day!)
+            ref_h = next(iter(hourly_data.values()))
+            all_dates_h = sorted(ref_h.index.tolist())
+            warmup_h = 100  # Need ~100 hourly candles for indicators
+            sim_dates = all_dates_h[warmup_h:]
+            # Limit to requested days worth of hourly candles
+            max_candles = days * 8  # ~8 trading hours per day
+            if len(sim_dates) > max_candles:
+                sim_dates = sim_dates[-max_candles:]
+            use_hourly = True
+        else:
+            ref_df = next(iter(all_data.values()))
+            all_dates = sorted(ref_df.index.tolist())
+            warmup = 50
+            sim_dates = all_dates[warmup:][-days:]
+            use_hourly = False
 
         # State
         cash = self.account_size
@@ -131,16 +152,21 @@ class Backtester:
         max_dd = 0.0
         consecutive_wins = 0
 
-        console.print(f"Simulating {len(sim_dates)} trading days...\n")
+        candle_type = "1H candles" if use_hourly else "daily candles"
+        console.print(f"Simulating {len(sim_dates)} {candle_type}...\n")
 
         for i, date in enumerate(sim_dates):
             date_str = date.strftime("%Y-%m-%d") if hasattr(date, 'strftime') else str(date)[:10]
 
             # === PHASE 6: DAY OF WEEK BIAS ===
             try:
-                day_of_week = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+                # Handle both daily (YYYY-MM-DD) and hourly (YYYY-MM-DD HH:MM) formats
+                if len(date_str) > 10:
+                    day_of_week = datetime.strptime(date_str[:10], "%Y-%m-%d").weekday()
+                else:
+                    day_of_week = datetime.strptime(date_str, "%Y-%m-%d").weekday()
             except Exception:
-                day_of_week = 2  # Default to Wednesday
+                day_of_week = 2
 
             skip_day = day_of_week == 0  # Monday = avoid (range forming)
             friday = day_of_week == 4    # Friday = smaller size
@@ -148,7 +174,10 @@ class Backtester:
             # 1. CHECK SL/TP + TRAILING STOP
             positions_to_close = []
             for pos in open_positions:
-                df = all_data.get(pos.symbol)
+                # Use hourly data for more precise SL/TP checking
+                df = hourly_data.get(pos.symbol) if use_hourly else all_data.get(pos.symbol)
+                if df is None:
+                    df = all_data.get(pos.symbol)
                 if df is None:
                     continue
                 mask = df.index <= date
@@ -198,9 +227,11 @@ class Backtester:
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
 
-                # Time exit: only close LOSERS after 15 days, let winners run
+                # Time exit: only close LOSERS after threshold, let winners run
                 if pos not in positions_to_close:
-                    days_held = sum(1 for d in sim_dates[:i+1] if str(d)[:10] >= pos.entry_date)
+                    # Count unique days held (not hours)
+                    entry_day = pos.entry_date[:10]
+                    days_held = len(set(str(d)[:10] for d in sim_dates[:i+1] if str(d)[:10] >= entry_day))
                     if pos.side == "long":
                         current_pnl = (close_price - pos.entry_price) * pos.quantity
                     else:
@@ -259,8 +290,15 @@ class Backtester:
                 scored = []
                 open_syms = [p.symbol for p in open_positions]
 
-                for sym, df in all_data.items():
+                # Use hourly data for entries when available, daily as fallback
+                data_source = hourly_data if use_hourly else all_data
+
+                for sym in data_source:
                     if sym in [p.symbol for p in open_positions]:
+                        continue
+
+                    df = data_source.get(sym)
+                    if df is None:
                         continue
 
                     # === PHASE 4: CORRELATION CHECK ===
@@ -320,10 +358,12 @@ class Backtester:
                         cash -= fill_price * quantity
                     open_positions.append(pos)
 
-            # 4. UPDATE equity
+            # 4. UPDATE equity (use hourly for more accurate pricing)
             unrealized = 0
             for pos in open_positions:
-                df = all_data.get(pos.symbol)
+                df = hourly_data.get(pos.symbol) if use_hourly else all_data.get(pos.symbol)
+                if df is None:
+                    df = all_data.get(pos.symbol)
                 if df is None:
                     continue
                 mask = df.index <= date
@@ -344,17 +384,25 @@ class Backtester:
             dd = (peak - equity) / peak * 100 if peak > 0 else 0
             max_dd = max(max_dd, dd)
 
-            daily_equity.append({
-                "date": date_str, "equity": round(equity, 2),
-                "cash": round(cash, 2), "positions": len(open_positions),
-                "unrealized": round(unrealized, 2),
-            })
+            # Record equity (once per day for hourly, every candle for daily)
+            day_date = date_str[:10]
+            if not daily_equity or daily_equity[-1]["date"] != day_date:
+                daily_equity.append({
+                    "date": day_date, "equity": round(equity, 2),
+                    "cash": round(cash, 2), "positions": len(open_positions),
+                    "unrealized": round(unrealized, 2),
+                })
+            else:
+                # Update today's entry
+                daily_equity[-1]["equity"] = round(equity, 2)
+                daily_equity[-1]["positions"] = len(open_positions)
 
             pct = (i + 1) / len(sim_dates) * 100
-            filled = int(30 * pct / 100)
-            bar = "█" * filled + "░" * (30 - filled)
-            ts = f"W:{sum(1 for t in closed_trades if t.pnl > 0)} L:{sum(1 for t in closed_trades if t.pnl <= 0)}"
-            console.print(f"\r  [{bar}] {pct:.0f}% | {date_str} | ${equity:,.0f} | Open:{len(open_positions)} | {ts}", end="")
+            if i % (5 if use_hourly else 1) == 0:
+                filled = int(30 * pct / 100)
+                bar = "█" * filled + "░" * (30 - filled)
+                ts = f"W:{sum(1 for t in closed_trades if t.pnl > 0)} L:{sum(1 for t in closed_trades if t.pnl <= 0)}"
+                console.print(f"\r  [{bar}] {pct:.0f}% | {day_date} | ${equity:,.0f} | Open:{len(open_positions)} | {ts}", end="")
 
         console.print("\n")
         return self._report(closed_trades, open_positions, daily_equity, max_dd, sim_dates)
