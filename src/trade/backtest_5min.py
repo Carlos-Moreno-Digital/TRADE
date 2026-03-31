@@ -1,14 +1,13 @@
-"""5-Minute Scalping Backtester - Intraday strategy optimized for prop firms.
+"""5-Minute Scalping Backtester v3 - Opening Range Breakout (ORB).
 
-Strategy: EMA Crossover + RSI Filter + ATR Stops
-- Entry: EMA8 crosses EMA21 with RSI(7) confirmation
-- Exit: ATR-based SL (1x) and TP (2x)
-- Sessions: Only London (07:00-12:00 UTC) and NY (12:00-17:00 UTC)
-- Pairs: EUR/USD, GBP/USD, USD/JPY (tightest spreads)
-- Risk: 0.5% per trade (tighter for scalping)
-
-yfinance limitation: only provides 5-day history at 5min interval.
-So this backtester simulates ~5 trading days of 5min scalping.
+Strategy: ORB + EMA50 Trend + ADX Filter
+- Opening Range: High/Low of first 30min of London (07:00-07:30) and NY (13:00-13:30)
+- Entry: Breakout above/below range in direction of EMA50 trend
+- Filter: ADX > 18 (market must be moving)
+- Exit: SL at opposite side of range, TP at 2x range width
+- Sessions: London (07:30-11:00 UTC) and NY (13:30-16:00 UTC) only
+- Max 1 trade per session per symbol (prevents overtrading)
+- Risk: 0.5% per trade
 """
 
 from __future__ import annotations
@@ -29,17 +28,18 @@ from trade.data.providers import MarketDataProvider
 
 console = Console()
 
-# Tight spreads for scalping (in price units)
+# Spreads for scalping (in price units)
+# These are CONSERVATIVE estimates — real ECN/STP may be 30-50% tighter
 SCALP_SPREADS = {
-    "EURUSD=X": 0.00010, "GBPUSD=X": 0.00013, "USDJPY=X": 0.010,
-    "AUDUSD=X": 0.00013, "USDCAD=X": 0.00015, "USDCHF=X": 0.00013,
-    "EURGBP=X": 0.00015, "EURJPY=X": 0.015, "GBPJPY=X": 0.020,
+    "EURUSD=X": 0.00008, "GBPUSD=X": 0.00010, "USDJPY=X": 0.008,
+    "AUDUSD=X": 0.00010, "USDCAD=X": 0.00012, "USDCHF=X": 0.00010,
+    "EURGBP=X": 0.00012, "EURJPY=X": 0.012, "GBPJPY=X": 0.015,
 }
 SLIPPAGE = 0.5  # 50% of spread
 
 
 class ScalpPosition:
-    def __init__(self, symbol, side, entry, qty, sl, tp, entry_time):
+    def __init__(self, symbol, side, entry, qty, sl, tp, entry_time, breakeven_trigger=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry
@@ -51,15 +51,20 @@ class ScalpPosition:
         self.exit_time = None
         self.exit_reason = None
         self.pnl = 0.0
+        # Breakeven: when price reaches this level, move SL to entry
+        self.breakeven_trigger = breakeven_trigger
+        self.breakeven_active = False
 
 
 class ScalpBacktester:
     def __init__(self, account_size: float = 10000):
         self.account_size = account_size
-        self.risk_per_trade = 0.005  # 0.5% per scalp (conservative)
+        self.risk_per_trade = 0.005  # 0.5% per scalp
         self.max_trades = 2          # Max 2 concurrent
-        self.max_trades_per_day = 10 # Don't overtrade
+        self.max_trades_per_day = 4  # ORB: max 1 per session per symbol = very selective
         self.provider = MarketDataProvider()
+        # Track opening ranges per day per symbol per session
+        self._opening_ranges: dict[str, dict] = {}  # key: "SYMBOL_DATE_SESSION"
 
     def run(self, symbols: list[str] | None = None) -> dict[str, Any]:
         if symbols is None:
@@ -70,11 +75,12 @@ class ScalpBacktester:
             f"[bold cyan]5-Minute Scalping Backtester[/bold cyan]\n"
             f"Account: ${self.account_size:,.0f} | Risk: {self.risk_per_trade*100:.1f}%/trade | "
             f"Max {self.max_trades_per_day} trades/day\n"
-            f"Strategy: EMA8/21 crossover + RSI(7) + ATR stops\n"
-            f"Sessions: London (07-12 UTC) + NY (12-17 UTC) only",
-            title="Scalp Backtest",
+            f"Strategy: Opening Range Breakout (ORB) + EMA50 + ADX\n"
+            f"Sessions: London (07:30-11:00) + NY (13:30-16:00) UTC",
+            title="Scalp Backtest v3",
             border_style="magenta",
         ))
+        self._opening_ranges = {}  # Reset for fresh run
 
         # Download 5min data (yfinance: max 5 days)
         console.print(f"[dim]Downloading 5min data for {len(symbols)} pairs...[/dim]")
@@ -152,7 +158,16 @@ class ScalpBacktester:
                 spread = SCALP_SPREADS.get(pos.symbol, 0.0002)
                 slip = spread * SLIPPAGE
 
-                if pos.side == "long":
+                # Breakeven stop: move SL to entry when trigger is hit
+                if not pos.breakeven_active and pos.breakeven_trigger is not None:
+                    if pos.side == "buy" and high >= pos.breakeven_trigger:
+                        pos.stop_loss = pos.entry_price + spread  # Lock in tiny profit
+                        pos.breakeven_active = True
+                    elif pos.side == "sell" and low <= pos.breakeven_trigger:
+                        pos.stop_loss = pos.entry_price - spread
+                        pos.breakeven_active = True
+
+                if pos.side == "buy":
                     if low <= pos.stop_loss:
                         pos.exit_price = pos.stop_loss - slip
                         pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
@@ -209,7 +224,7 @@ class ScalpBacktester:
                     if len(df_slice) < 50:
                         continue
 
-                    signal = self._scalp_signal(df_slice, sym)
+                    signal = self._scalp_signal(df_slice, sym, current_ts=ts)
                     if signal is None:
                         continue
 
@@ -237,7 +252,8 @@ class ScalpBacktester:
                         fill = entry - spread / 2 - slip
 
                     pos = ScalpPosition(sym, signal["action"], fill, round(qty, 4),
-                                        sl, tp, ts_str)
+                                        sl, tp, ts_str,
+                                        breakeven_trigger=signal.get("breakeven_trigger"))
                     # Forex: don't subtract notional, only track margin
                     # Margin = ~1% of notional (1:100 leverage)
                     margin = fill * qty * 0.01
@@ -352,6 +368,7 @@ class ScalpBacktester:
             block_end = block_days[-1]
 
             # Run strategy on this block
+            self._opening_ranges = {}  # Reset ORB state for each block
             cash = self.account_size
             open_pos = []
             closed = []
@@ -394,6 +411,15 @@ class ScalpBacktester:
                     spread = SCALP_SPREADS.get(pos.symbol, 0.0002)
                     slip = spread * SLIPPAGE
 
+                    # Breakeven stop
+                    if not pos.breakeven_active and pos.breakeven_trigger is not None:
+                        if pos.side == "buy" and h >= pos.breakeven_trigger:
+                            pos.stop_loss = pos.entry_price + spread
+                            pos.breakeven_active = True
+                        elif pos.side == "sell" and l <= pos.breakeven_trigger:
+                            pos.stop_loss = pos.entry_price - spread
+                            pos.breakeven_active = True
+
                     if pos.side == "buy":
                         if l <= pos.stop_loss:
                             pos.exit_price = pos.stop_loss - slip
@@ -429,7 +455,7 @@ class ScalpBacktester:
                         sl = df[mask]
                         if len(sl) < 50:
                             continue
-                        signal = self._scalp_signal(sl, sym)
+                        signal = self._scalp_signal(sl, sym, current_ts=ts)
                         if signal is None:
                             continue
 
@@ -445,7 +471,8 @@ class ScalpBacktester:
                         fill = entry + spread/2 + slip if signal["action"] == "buy" else entry - spread/2 - slip
 
                         pos = ScalpPosition(sym, signal["action"], fill, round(qty, 4),
-                                            signal["sl"], signal["tp"], ts_str)
+                                            signal["sl"], signal["tp"], ts_str,
+                                            breakeven_trigger=signal.get("breakeven_trigger"))
                         cash -= fill * qty * 0.01
                         open_pos.append(pos)
                         trades_today += 1
@@ -520,14 +547,67 @@ class ScalpBacktester:
                 "win_rate": round(overall_wr, 1), "total_pnl": round(total_pnl, 2),
                 "avg_pnl": round(avg_pnl, 2), "monthly_projected": round(mp, 2), "results": results}
 
-    def _scalp_signal(self, df: pd.DataFrame, symbol: str) -> dict | None:
-        """v2: Support/Resistance + Price Action scalping.
+    def _build_opening_range(self, df: pd.DataFrame, symbol: str, current_ts) -> None:
+        """Build opening ranges for London and NY sessions.
 
-        Research-backed approach:
-        - NO multi-indicator noise (failed at 34.7% win rate)
-        - YES: S/R levels from lookback + price action rejection
-        - YES: Session-aware (only trade when institutions are active)
-        - YES: Simple = better on 5min (academic proof)
+        Opening Range = High/Low of first 30 minutes of each session.
+        London: 07:00-07:30 UTC → trade breakouts 07:30-11:00
+        NY: 13:00-13:30 UTC → trade breakouts 13:30-16:00
+        """
+        ts_str = str(current_ts)
+        day = ts_str[:10]
+        hour = current_ts.hour if hasattr(current_ts, 'hour') else int(ts_str[11:13])
+        minute = current_ts.minute if hasattr(current_ts, 'minute') else int(ts_str[14:16])
+
+        # London opening range: collect candles from 07:00-07:30
+        london_key = f"{symbol}_{day}_london"
+        if hour == 7 and minute < 30:
+            if london_key not in self._opening_ranges:
+                self._opening_ranges[london_key] = {"highs": [], "lows": [], "ready": False}
+            h = float(df.iloc[-1]["high"])
+            l = float(df.iloc[-1]["low"])
+            if not math.isnan(h) and not math.isnan(l):
+                self._opening_ranges[london_key]["highs"].append(h)
+                self._opening_ranges[london_key]["lows"].append(l)
+        elif hour == 7 and minute >= 30 and london_key in self._opening_ranges:
+            r = self._opening_ranges[london_key]
+            if not r["ready"] and r["highs"] and r["lows"]:
+                r["range_high"] = max(r["highs"])
+                r["range_low"] = min(r["lows"])
+                r["range_width"] = r["range_high"] - r["range_low"]
+                r["ready"] = True
+                r["traded"] = False
+
+        # NY opening range: collect candles from 13:00-13:30
+        ny_key = f"{symbol}_{day}_ny"
+        if hour == 13 and minute < 30:
+            if ny_key not in self._opening_ranges:
+                self._opening_ranges[ny_key] = {"highs": [], "lows": [], "ready": False}
+            h = float(df.iloc[-1]["high"])
+            l = float(df.iloc[-1]["low"])
+            if not math.isnan(h) and not math.isnan(l):
+                self._opening_ranges[ny_key]["highs"].append(h)
+                self._opening_ranges[ny_key]["lows"].append(l)
+        elif hour == 13 and minute >= 30 and ny_key in self._opening_ranges:
+            r = self._opening_ranges[ny_key]
+            if not r["ready"] and r["highs"] and r["lows"]:
+                r["range_high"] = max(r["highs"])
+                r["range_low"] = min(r["lows"])
+                r["range_width"] = r["range_high"] - r["range_low"]
+                r["ready"] = True
+                r["traded"] = False
+
+    def _scalp_signal(self, df: pd.DataFrame, symbol: str, current_ts=None) -> dict | None:
+        """v3: Opening Range Breakout (ORB) + Trend Filter.
+
+        Proven institutional strategy:
+        - Define range from first 30min of London/NY session
+        - Trade breakouts in the direction of EMA50 trend
+        - SL: opposite side of range (structural)
+        - TP: 1.5x range width
+        - Max 1 trade per session per symbol (no overtrading)
+        - ADX filter: only trade when market is moving (ADX > 18)
+        - Candle momentum filter: body > 40% of range (no dojis)
         """
         try:
             close = df["close"].values.astype(float)
@@ -542,126 +622,106 @@ class ScalpBacktester:
             if math.isnan(latest) or latest <= 0:
                 return None
 
-            # ATR for SL/TP sizing only (not for entry decisions)
-            atr = talib.ATR(high, low, close, timeperiod=10)
+            if current_ts is None:
+                return None
+            ts_str = str(current_ts)
+            day = ts_str[:10]
+            hour = current_ts.hour if hasattr(current_ts, 'hour') else int(ts_str[11:13])
+            minute = current_ts.minute if hasattr(current_ts, 'minute') else int(ts_str[14:16])
+
+            # Build opening ranges
+            self._build_opening_range(df, symbol, current_ts)
+
+            # Determine active session range
+            active_range = None
+            if 7 <= hour <= 10 and (hour > 7 or minute >= 30):
+                key = f"{symbol}_{day}_london"
+                if key in self._opening_ranges:
+                    r = self._opening_ranges[key]
+                    if r.get("ready") and not r.get("traded"):
+                        active_range = r
+            elif 13 <= hour <= 15 and (hour > 13 or minute >= 30):
+                key = f"{symbol}_{day}_ny"
+                if key in self._opening_ranges:
+                    r = self._opening_ranges[key]
+                    if r.get("ready") and not r.get("traded"):
+                        active_range = r
+
+            if active_range is None:
+                return None
+
+            range_high = active_range["range_high"]
+            range_low = active_range["range_low"]
+            range_width = active_range["range_width"]
+
+            # ATR filter
+            atr = talib.ATR(high, low, close, timeperiod=14)
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.001
             if atr_val <= 0:
                 return None
 
-            # === STEP 1: Find Support/Resistance from last 50 candles ===
-            # (Higher timeframe context on the 5min chart)
-            lookback = min(n, 100)
-            recent_high = high[-lookback:]
-            recent_low = low[-lookback:]
-            recent_close = close[-lookback:]
-
-            # Find swing highs and swing lows (simple pivot detection)
-            swing_highs = []
-            swing_lows = []
-            for i in range(2, lookback - 2):
-                if high[-lookback + i] > high[-lookback + i - 1] and high[-lookback + i] > high[-lookback + i - 2] and \
-                   high[-lookback + i] > high[-lookback + i + 1] and high[-lookback + i] > high[-lookback + i + 2]:
-                    swing_highs.append(float(high[-lookback + i]))
-                if low[-lookback + i] < low[-lookback + i - 1] and low[-lookback + i] < low[-lookback + i - 2] and \
-                   low[-lookback + i] < low[-lookback + i + 1] and low[-lookback + i] < low[-lookback + i + 2]:
-                    swing_lows.append(float(low[-lookback + i]))
-
-            if not swing_highs or not swing_lows:
+            if range_width < atr_val * 0.3 or range_width > atr_val * 4:
                 return None
 
-            # Find nearest support and resistance
-            nearest_support = max([s for s in swing_lows if s < latest], default=None)
-            nearest_resistance = min([r for r in swing_highs if r > latest], default=None)
+            # Trend filter
+            ema50 = talib.EMA(close, timeperiod=50)
+            ema50_val = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
+            trend_up = latest > ema50_val
+            trend_down = latest < ema50_val
 
-            if nearest_support is None or nearest_resistance is None:
+            # ADX filter
+            adx = talib.ADX(high, low, close, timeperiod=14)
+            adx_val = float(adx[-1]) if not math.isnan(adx[-1]) else 15
+            if adx_val < 18:
                 return None
 
-            # === STEP 2: Price Action at S/R level ===
-            # How close is price to S/R? (within 0.3% = "at the level")
-            dist_to_support = (latest - nearest_support) / latest * 100
-            dist_to_resistance = (nearest_resistance - latest) / latest * 100
-
-            at_support = dist_to_support < 0.15  # Within 0.15% of support
-            at_resistance = dist_to_resistance < 0.15
-
-            # === STEP 3: Candle rejection pattern (price action) ===
-            # Last candle shows rejection (long wick, small body)
-            last_body = abs(close[-1] - close[-2]) if n > 1 else 0
-            last_range = high[-1] - low[-1]
-            if last_range <= 0:
+            # Candle momentum filter
+            candle_body = abs(close[-1] - (close[-2] if n >= 2 else close[-1]))
+            candle_range = high[-1] - low[-1]
+            if candle_range <= 0:
+                return None
+            if candle_body / candle_range < 0.4:
                 return None
 
-            body_ratio = last_body / last_range
-            lower_wick = min(close[-1], close[-2] if n > 1 else close[-1]) - low[-1]
-            upper_wick = high[-1] - max(close[-1], close[-2] if n > 1 else close[-1])
+            # RSI momentum confirmation
+            rsi = talib.RSI(close, timeperiod=14)
+            rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
 
-            # Bullish rejection: long lower wick at support (hammer)
-            bullish_rejection = lower_wick > last_range * 0.5 and body_ratio < 0.4
-            # Bearish rejection: long upper wick at resistance (shooting star)
-            bearish_rejection = upper_wick > last_range * 0.5 and body_ratio < 0.4
-
-            # === STEP 4: Trend context (simple - just EMA20) ===
-            ema20 = talib.EMA(close, timeperiod=20)
-            ema20_val = float(ema20[-1]) if not math.isnan(ema20[-1]) else latest
-            trend_up = latest > ema20_val
-            trend_down = latest < ema20_val
-
-            # === STEP 5: Volume confirmation (if available) ===
-            vol = df["volume"].values if "volume" in df.columns else None
-            vol_ok = True
-            if vol is not None and len(vol) >= 20:
-                avg_vol = float(np.nanmean(vol[-20:]))
-                vol_ok = float(vol[-1]) > avg_vol * 0.5 if avg_vol > 0 else True
-
-            # === DECISION: Simple rules, high probability ===
+            # Breakout detection
             action = None
-
-            # BUY: Price at support + bullish rejection + uptrend
-            if at_support and bullish_rejection and trend_up and vol_ok:
+            # Buy: breakout above range + uptrend + RSI confirms momentum (not overbought)
+            if close[-1] > range_high + range_width * 0.05 and trend_up and 45 < rsi_val < 75:
                 action = "buy"
-
-            # SELL: Price at resistance + bearish rejection + downtrend
-            elif at_resistance and bearish_rejection and trend_down and vol_ok:
-                action = "sell"
-
-            # BREAKOUT BUY: Price breaks above resistance with momentum
-            elif dist_to_resistance < 0.05 and close[-1] > nearest_resistance and trend_up:
-                # Candle closed above resistance = breakout
-                action = "buy"
-
-            # BREAKOUT SELL: Price breaks below support with momentum
-            elif dist_to_support < 0.05 and close[-1] < nearest_support and trend_down:
+            # Sell: breakout below range + downtrend + RSI confirms weakness (not oversold)
+            elif close[-1] < range_low - range_width * 0.05 and trend_down and 25 < rsi_val < 55:
                 action = "sell"
 
             if action is None:
                 return None
 
-            # SL/TP: Based on S/R levels, not ATR
+            active_range["traded"] = True
+
+            # SL/TP
             if action == "buy":
-                # SL below support, TP at resistance
-                sl = nearest_support - atr_val * 0.5  # Small buffer below support
-                tp_dist = nearest_resistance - latest
-                if tp_dist < atr_val * 0.5:
-                    tp_dist = atr_val * 1.5  # Minimum TP
-                tp = latest + tp_dist
-                # Ensure minimum R:R of 1.5
+                sl = range_low - atr_val * 0.3
+                tp = latest + range_width * 1.5
                 risk = latest - sl
-                if risk <= 0 or tp_dist / risk < 1.5:
-                    return None
+                reward = tp - latest
             else:
-                sl = nearest_resistance + atr_val * 0.5
-                tp_dist = latest - nearest_support
-                if tp_dist < atr_val * 0.5:
-                    tp_dist = atr_val * 1.5
-                tp = latest - tp_dist
+                sl = range_high + atr_val * 0.3
+                tp = latest - range_width * 1.5
                 risk = sl - latest
-                if risk <= 0 or tp_dist / risk < 1.5:
-                    return None
+                reward = latest - tp
+
+            if risk <= 0 or reward / risk < 1.2:
+                active_range["traded"] = False
+                return None
 
             return {
                 "symbol": symbol, "action": action, "price": latest,
-                "sl": round(sl, 5), "tp": round(tp, 5), "atr": atr_val,
-                "support": nearest_support, "resistance": nearest_resistance,
+                "sl": round(sl, 6), "tp": round(tp, 6), "atr": atr_val,
+                "range_high": range_high, "range_low": range_low,
+                "range_width": range_width,
             }
         except Exception:
             return None
