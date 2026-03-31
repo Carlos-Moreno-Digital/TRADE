@@ -36,7 +36,7 @@ class ReportGenerator:
 
         self._print_decision_summary(decisions)
         self._print_trade_stats(trade_stats)
-        self._print_agent_accuracy(decisions)
+        self._print_signal_quality(decisions)
         self._print_symbol_breakdown(decisions)
         self._print_session_analysis(decisions)
         self._print_risk_analysis(decisions)
@@ -89,19 +89,39 @@ class ReportGenerator:
 
         console.print(table)
 
-    def _print_agent_accuracy(self, decisions: list[dict]) -> None:
-        """Analyze which agents were most accurate."""
-        console.print(f"\n[bold]Risk Engine Analysis[/bold]")
+    def _print_signal_quality(self, decisions: list[dict]) -> None:
+        """Analyze signal quality and what would have happened."""
+        console.print(f"\n[bold]Signal Quality Analysis[/bold]")
 
+        # Risk engine stats
         vetoed = sum(1 for d in decisions if d.get("prop_firm_check") == "veto")
         passed = sum(1 for d in decisions if d.get("prop_firm_check") == "pass")
+        console.print(f"  Risk checks passed: {passed} | Vetoed: {vetoed}")
 
-        console.print(f"  Risk checks passed: {passed}")
-        console.print(f"  Risk vetoes (trades blocked): {vetoed}")
+        # Confidence distribution
+        buy_confs = [d["confidence"] for d in decisions if d["action"] == "buy" and d.get("confidence")]
+        sell_confs = [d["confidence"] for d in decisions if d["action"] == "sell" and d.get("confidence")]
+        hold_confs = [d["confidence"] for d in decisions if d["action"] == "hold" and d.get("confidence")]
 
-        if vetoed > 0:
-            veto_pct = vetoed / (vetoed + passed) * 100
-            console.print(f"  Veto rate: {veto_pct:.1f}%")
+        if buy_confs:
+            console.print(f"  Avg BUY confidence:  {sum(buy_confs)/len(buy_confs):.0%} ({len(buy_confs)} signals)")
+        if sell_confs:
+            console.print(f"  Avg SELL confidence: {sum(sell_confs)/len(sell_confs):.0%} ({len(sell_confs)} signals)")
+        if hold_confs:
+            console.print(f"  Avg HOLD confidence: {sum(hold_confs)/len(hold_confs):.0%} ({len(hold_confs)} signals)")
+
+        # Recommendations
+        total_actionable = len(buy_confs) + len(sell_confs)
+        total = len(decisions)
+        action_rate = total_actionable / total * 100 if total > 0 else 0
+
+        console.print(f"\n  [bold]Bot Activity Rate:[/bold] {action_rate:.0f}% of scans produce a signal")
+        if action_rate < 15:
+            console.print("  [yellow]Low activity - bot is very conservative. May need tuning.[/yellow]")
+        elif action_rate < 35:
+            console.print("  [green]Balanced - selective but active enough for prop firm.[/green]")
+        else:
+            console.print("  [yellow]High activity - may be overtrading. Watch risk limits.[/yellow]")
 
     def _print_symbol_breakdown(self, decisions: list[dict]) -> None:
         """Breakdown by symbol."""

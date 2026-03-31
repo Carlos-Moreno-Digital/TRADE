@@ -122,20 +122,20 @@ class PortfolioManagerAgent(BaseAgent):
         elif not context.metadata.get("optimal_time", True):
             confidence_modifier = 0.7  # -30% confidence outside optimal times
 
-        # Decision thresholds (HIGHER than before - require stronger consensus)
-        min_confidence = self.config.get("min_confidence", 0.35)
+        # Decision thresholds - balanced: not too aggressive, not too conservative
+        min_confidence = self.config.get("min_confidence", 0.30)
 
-        if final_score > 0.4:  # Was 0.3 - now requires stronger consensus
+        if final_score > 0.35:
             action = TradeAction.BUY
-            if final_score > 0.7:
+            if final_score > 0.65:
                 strength = SignalStrength.STRONG_BUY
-            elif final_score > 0.5:
+            elif final_score > 0.45:
                 strength = SignalStrength.BUY
             else:
                 strength = SignalStrength.WEAK_BUY
-        elif final_score < -0.4:  # Was -0.3
+        elif final_score < -0.35:
             action = TradeAction.SELL
-            if final_score < -0.7:
+            if final_score < -0.65:
                 strength = SignalStrength.STRONG_SELL
             elif final_score < -0.5:
                 strength = SignalStrength.SELL

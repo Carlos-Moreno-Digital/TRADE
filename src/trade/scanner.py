@@ -390,7 +390,18 @@ class MarketScanner:
         # Filter: must have some directional bias (not flat)
         candidates = [r for r in scan_results if abs(r.score) > 0.1 and r.is_open]
 
-        top = candidates[:self.top_n]
+        # DIVERSITY: Don't pick multiple instruments from same asset class
+        # Pick max 1 per class, spread across forex/commodity/index/crypto
+        seen_classes = set()
+        diverse_top = []
+        for c in candidates:
+            if c.asset_class not in seen_classes or len(diverse_top) < 2:
+                diverse_top.append(c)
+                seen_classes.add(c.asset_class)
+                if len(diverse_top) >= self.top_n:
+                    break
+
+        top = diverse_top if diverse_top else candidates[:self.top_n]
 
         if top:
             logger.info(
@@ -474,12 +485,25 @@ class MarketScanner:
             trend = "bullish" if momentum > 0 else "bearish" if momentum < 0 else "neutral"
 
         # Score: combines momentum strength + volume confirmation
-        # Higher absolute score = better setup (direction doesn't matter)
         vol_bonus = min(1.5, volume_ratio) / 1.5  # 0 to 1.0
         score = momentum * (0.5 + 0.5 * vol_bonus)
 
         # Normalize to -1 to 1
         score = max(-1.0, min(1.0, score / 5.0))
+
+        # PROP FIRM PRIORITY: Boost instruments that FunderPro actually offers
+        # Forex and commodities are the core of prop firm trading
+        prop_firm_boost = {
+            "forex": 1.3,       # +30% - core prop firm instruments
+            "commodity": 1.2,   # +20% - gold, oil very popular
+            "index": 1.1,       # +10% - indices available too
+            "crypto": 1.0,      # neutral
+            "etf": 0.7,         # -30% - ETFs less relevant for prop firms
+            "stock_us": 0.6,    # -40% - individual stocks not typically on prop firms
+            "stock_eu": 0.6,    # -40% - same
+        }
+        boost = prop_firm_boost.get(asset_class, 1.0)
+        score = max(-1.0, min(1.0, score * boost))
 
         return ScanResult(
             symbol=symbol,
