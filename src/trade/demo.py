@@ -214,62 +214,129 @@ class DemoRunner:
         return results
 
     def _print_cycle_results(self, results: list[dict]) -> None:
-        """Print results for this cycle."""
-        table = Table(show_header=True, header_style="bold")
+        """Print results + full account dashboard."""
+
+        # =====================================================================
+        # 1. TRADE DECISIONS TABLE
+        # =====================================================================
+        table = Table(title="Trade Decisions", show_header=True, header_style="bold")
         table.add_column("Symbol", style="cyan", width=12)
         table.add_column("Decision", width=10)
-        table.add_column("Agents", width=45)
-        table.add_column("SMC", width=15)
+        table.add_column("Agents", width=40)
+        table.add_column("Confidence", width=10)
         table.add_column("Time", width=8)
 
         for result in results:
             decision = result["final_decision"]
             d_style = "green bold" if "buy" in decision else "red bold" if "sell" in decision else "dim"
 
-            # Agent summary
             agent_summary = []
             for a in result.get("agents", []):
                 icon = "+" if "buy" in a["action"] else "-" if "sell" in a["action"] else "="
                 agent_summary.append(f"{a['name'][:4]}:{icon}")
 
-            # SMC info from the analysis
-            smc_info = ""
-            for a in result.get("agents", []):
-                if a.get("name") == "smc":
-                    smc_info = a.get("reasoning", "")[:15]
-
             skip_reason = result.get("skip_reason", "")
             if skip_reason:
-                agent_summary = [f"SKIP: {skip_reason[:35]}"]
+                agent_summary = [f"SKIP: {skip_reason[:30]}"]
+
+            # Get portfolio manager confidence
+            pm_conf = 0.0
+            for a in result.get("agents", []):
+                if a.get("name") == "portfolio_manager":
+                    pm_conf = a.get("confidence", 0)
 
             table.add_row(
                 result["symbol"],
                 f"[{d_style}]{decision.upper()}[/{d_style}]",
                 " | ".join(agent_summary),
-                smc_info or "[dim]n/a[/dim]",
+                f"{pm_conf:.0%}",
                 f"{result['total_time_ms']:.0f}ms",
             )
 
         console.print(table)
 
-        # Show prop firm challenge progress
-        if self.risk_engine:
-            progress = self.risk_engine.get_challenge_progress(
-                self.orchestrator.portfolio.total_value
-            )
-            status = progress.get("safety_status", "?")
-            status_color = {
-                "SAFE": "green", "CAUTION": "yellow",
-                "DANGER": "red", "CRITICAL": "red bold", "DEAD": "red bold",
-            }.get(status, "white")
+        # =====================================================================
+        # 2. ACCOUNT DASHBOARD (the $10K panel)
+        # =====================================================================
+        portfolio = self.orchestrator.portfolio
+        prop = self.risk_engine
 
-            console.print(
-                f"[bold]Challenge:[/bold] {progress.get('progress_pct', 0):.1f}% "
-                f"| Equity: ${progress.get('current_equity', 0):,.2f} "
-                f"| DD: {progress.get('total_drawdown_pct', 0):.2f}% "
-                f"| Status: [{status_color}]{status}[/{status_color}] "
-                f"| Trades today: {progress.get('trades_today', 0)}"
-            )
+        # Challenge progress
+        progress = prop.get_challenge_progress(portfolio.total_value) if prop else {}
+        status = progress.get("safety_status", "?")
+        status_color = {
+            "SAFE": "green", "CAUTION": "yellow",
+            "DANGER": "red", "CRITICAL": "red bold", "DEAD": "red bold",
+        }.get(status, "white")
+
+        initial = progress.get("initial_balance", 10000)
+        equity = portfolio.total_value
+        profit = equity - initial
+        profit_pct = (profit / initial * 100) if initial > 0 else 0
+        target_pct = progress.get("target_pct", 10)
+        target_amount = initial * target_pct / 100
+        remaining = target_amount - profit
+        progress_pct = progress.get("progress_pct", 0)
+
+        # Build account panel
+        lines = []
+        lines.append(f"[bold]CUENTA FUNDERPRO $10K CLASSIC[/bold]")
+        lines.append(f"")
+
+        # Balance
+        profit_color = "green" if profit >= 0 else "red"
+        lines.append(f"  Capital inicial:  ${initial:>10,.2f}")
+        lines.append(f"  Equity actual:    ${equity:>10,.2f}  [{profit_color}]({profit:+,.2f} / {profit_pct:+.2f}%)[/{profit_color}]")
+        lines.append(f"  Cash disponible:  ${portfolio.cash:>10,.2f}")
+        lines.append(f"")
+
+        # Progress toward target
+        bar_len = 30
+        filled = int(bar_len * min(1, progress_pct / 100))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        lines.append(f"  Objetivo: ${target_amount:,.0f} ({target_pct}%)  |  Progreso: {progress_pct:.1f}%")
+        lines.append(f"  [{profit_color}]{bar}[/{profit_color}]  Faltan: ${max(0, remaining):,.2f}")
+        lines.append(f"")
+
+        # Risk limits
+        daily_pnl = portfolio.daily_pnl
+        daily_pnl_color = "green" if daily_pnl >= 0 else "red"
+        dd = progress.get("total_drawdown_pct", 0)
+        daily_loss_pct = progress.get("daily_loss_pct", 0)
+
+        lines.append(f"  [bold]LIMITES DE RIESGO[/bold]")
+        lines.append(f"  P&L del dia:     [{daily_pnl_color}]${daily_pnl:>+10,.2f}[/{daily_pnl_color}]  (limite: -${initial * 0.05:,.0f} = -5%)")
+        lines.append(f"  Drawdown total:   {dd:>6.2f}%     (limite: 10% = -${initial * 0.10:,.0f})")
+        lines.append(f"  Trades hoy:       {progress.get('trades_today', 0):>6d}      (limite: {prop.config.max_trades_per_day if prop else 5})")
+        lines.append(f"  Perdidas seguidas:{portfolio.consecutive_losses:>6d}      (limite: {prop.config.consecutive_loss_threshold if prop else 2})")
+        lines.append(f"  Estado:           [{status_color}]{status:>6s}[/{status_color}]")
+        lines.append(f"")
+
+        # Open positions
+        if portfolio.positions:
+            lines.append(f"  [bold]POSICIONES ABIERTAS ({len(portfolio.positions)})[/bold]")
+            for pos in portfolio.positions:
+                pnl = pos.unrealized_pnl
+                pnl_pct = pos.unrealized_pnl_pct
+                pnl_color = "green" if pnl >= 0 else "red"
+                side_icon = "🔼" if pos.side == "long" else "🔽"
+                sl_str = f"SL:{pos.stop_loss:.5f}" if pos.stop_loss else "SL:---"
+                tp_str = f"TP:{pos.take_profit:.5f}" if pos.take_profit else "TP:---"
+                lines.append(
+                    f"  {side_icon} {pos.symbol:<12s} {pos.side.upper():<5s} "
+                    f"x{pos.quantity:<6.2f} @ {pos.entry_price:.5f}  "
+                    f"[{pnl_color}]P&L: ${pnl:>+8,.2f} ({pnl_pct:>+.1f}%)[/{pnl_color}]  "
+                    f"{sl_str}  {tp_str}"
+                )
+        else:
+            lines.append(f"  [dim]Sin posiciones abiertas[/dim]")
+
+        console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold]Dashboard Cuenta ${initial:,.0f}[/bold]",
+            border_style=status_color,
+            width=90,
+        ))
 
     def _wait_for_next_cycle(self) -> None:
         """Wait for next cycle with countdown."""
