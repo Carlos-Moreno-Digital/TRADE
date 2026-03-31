@@ -62,6 +62,9 @@ Examples:
         help="Prop firm config name (default: funderpro_classic_10k)"
     )
 
+    # Scanner
+    parser.add_argument("--top-n", type=int, default=3, help="Number of top candidates to deep analyze (default: 3)")
+
     # Reports
     parser.add_argument("--report", action="store_true", help="Show analysis report")
     parser.add_argument("--report-days", type=int, default=7, help="Report period in days (default: 7)")
@@ -121,6 +124,7 @@ def main() -> None:
             prop_firm=args.prop_firm,
             interval_minutes=args.interval,
             symbols=symbols,
+            top_n=args.top_n,
         )
         runner.run()
         return
