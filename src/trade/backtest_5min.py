@@ -343,8 +343,20 @@ class ScalpBacktester:
 
             window_data = {}
             for sym, df in hourly_data.items():
-                mask = (df.index >= pd.Timestamp(warmup_date)) & (df.index <= pd.Timestamp(end_date + " 23:59"))
-                sliced = df[mask]
+                # Handle timezone-aware vs naive index
+                try:
+                    if df.index.tz is not None:
+                        start_ts = pd.Timestamp(warmup_date).tz_localize(df.index.tz)
+                        end_ts = pd.Timestamp(end_date + " 23:59").tz_localize(df.index.tz)
+                    else:
+                        start_ts = pd.Timestamp(warmup_date)
+                        end_ts = pd.Timestamp(end_date + " 23:59")
+                    mask = (df.index >= start_ts) & (df.index <= end_ts)
+                    sliced = df[mask]
+                except Exception:
+                    # Fallback: use string comparison on index
+                    sliced = df[df.index.astype(str).str[:10] >= warmup_date]
+                    sliced = sliced[sliced.index.astype(str).str[:10] <= end_date]
                 if len(sliced) >= 50:
                     window_data[sym] = sliced
 
