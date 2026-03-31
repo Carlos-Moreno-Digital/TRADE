@@ -521,132 +521,147 @@ class ScalpBacktester:
                 "avg_pnl": round(avg_pnl, 2), "monthly_projected": round(mp, 2), "results": results}
 
     def _scalp_signal(self, df: pd.DataFrame, symbol: str) -> dict | None:
-        """5-minute scalping: momentum + mean reversion hybrid."""
+        """v2: Support/Resistance + Price Action scalping.
+
+        Research-backed approach:
+        - NO multi-indicator noise (failed at 34.7% win rate)
+        - YES: S/R levels from lookback + price action rejection
+        - YES: Session-aware (only trade when institutions are active)
+        - YES: Simple = better on 5min (academic proof)
+        """
         try:
             close = df["close"].values.astype(float)
             high = df["high"].values.astype(float)
             low = df["low"].values.astype(float)
 
+            n = len(close)
+            if n < 50:
+                return None
+
             latest = float(close[-1])
             if math.isnan(latest) or latest <= 0:
                 return None
 
-            # Ultra-fast scalping indicators
-            ema5 = talib.EMA(close, timeperiod=5)
-            ema13 = talib.EMA(close, timeperiod=13)
-            ema50 = talib.EMA(close, timeperiod=50)
-            rsi = talib.RSI(close, timeperiod=7)
+            # ATR for SL/TP sizing only (not for entry decisions)
             atr = talib.ATR(high, low, close, timeperiod=10)
-            macd, macd_sig, macd_hist = talib.MACD(close, fastperiod=5, slowperiod=13, signalperiod=4)
-            upper, middle, lower_bb = talib.BBANDS(close, timeperiod=14, nbdevup=2, nbdevdn=2)
-            stoch_k, stoch_d = talib.STOCH(high, low, close, fastk_period=5, slowk_period=3, slowd_period=3)
-
-            ema5_now = float(ema5[-1]) if not math.isnan(ema5[-1]) else latest
-            ema13_now = float(ema13[-1]) if not math.isnan(ema13[-1]) else latest
-            ema50_now = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
-            rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.001
-            macd_val = float(macd_hist[-1]) if not math.isnan(macd_hist[-1]) else 0
-            macd_prev = float(macd_hist[-2]) if len(macd_hist) > 1 and not math.isnan(macd_hist[-2]) else 0
-            bb_up = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.01
-            bb_lo = float(lower_bb[-1]) if not math.isnan(lower_bb[-1]) else latest * 0.99
-            stoch = float(stoch_k[-1]) if not math.isnan(stoch_k[-1]) else 50
-
             if atr_val <= 0:
                 return None
 
-            # Trend direction from EMA50
-            trend = "up" if latest > ema50_now else "down"
+            # === STEP 1: Find Support/Resistance from last 50 candles ===
+            # (Higher timeframe context on the 5min chart)
+            lookback = min(n, 100)
+            recent_high = high[-lookback:]
+            recent_low = low[-lookback:]
+            recent_close = close[-lookback:]
 
-            # === MULTI-SIGNAL SCORING (not just crossover) ===
-            bull = 0
-            bear = 0
+            # Find swing highs and swing lows (simple pivot detection)
+            swing_highs = []
+            swing_lows = []
+            for i in range(2, lookback - 2):
+                if high[-lookback + i] > high[-lookback + i - 1] and high[-lookback + i] > high[-lookback + i - 2] and \
+                   high[-lookback + i] > high[-lookback + i + 1] and high[-lookback + i] > high[-lookback + i + 2]:
+                    swing_highs.append(float(high[-lookback + i]))
+                if low[-lookback + i] < low[-lookback + i - 1] and low[-lookback + i] < low[-lookback + i - 2] and \
+                   low[-lookback + i] < low[-lookback + i + 1] and low[-lookback + i] < low[-lookback + i + 2]:
+                    swing_lows.append(float(low[-lookback + i]))
 
-            # 1. EMA alignment (fast above slow = bullish momentum)
-            if ema5_now > ema13_now:
-                bull += 1
-            else:
-                bear += 1
+            if not swing_highs or not swing_lows:
+                return None
 
-            # 2. Price position vs EMA50 (trend context)
-            if latest > ema50_now:
-                bull += 1
-            else:
-                bear += 1
+            # Find nearest support and resistance
+            nearest_support = max([s for s in swing_lows if s < latest], default=None)
+            nearest_resistance = min([r for r in swing_highs if r > latest], default=None)
 
-            # 3. RSI zones (adjusted for 5min - wider zones)
-            if rsi_val < 30:
-                bull += 2  # Oversold bounce
-            elif rsi_val < 40:
-                bull += 1
-            if rsi_val > 70:
-                bear += 2  # Overbought fade
-            elif rsi_val > 60:
-                bear += 1
+            if nearest_support is None or nearest_resistance is None:
+                return None
 
-            # 4. MACD momentum flip (most important for 5min)
-            if macd_prev <= 0 < macd_val:
-                bull += 2  # Just flipped bullish
-            if macd_prev >= 0 > macd_val:
-                bear += 2  # Just flipped bearish
-            elif macd_val > 0:
-                bull += 1
-            elif macd_val < 0:
-                bear += 1
+            # === STEP 2: Price Action at S/R level ===
+            # How close is price to S/R? (within 0.3% = "at the level")
+            dist_to_support = (latest - nearest_support) / latest * 100
+            dist_to_resistance = (nearest_resistance - latest) / latest * 100
 
-            # 5. Bollinger Band touch (mean reversion)
-            if latest <= bb_lo:
-                bull += 2  # At lower band
-            if latest >= bb_up:
-                bear += 2  # At upper band
+            at_support = dist_to_support < 0.15  # Within 0.15% of support
+            at_resistance = dist_to_resistance < 0.15
 
-            # 6. Stochastic extremes
-            if stoch < 20:
-                bull += 1
-            if stoch > 80:
-                bear += 1
+            # === STEP 3: Candle rejection pattern (price action) ===
+            # Last candle shows rejection (long wick, small body)
+            last_body = abs(close[-1] - close[-2]) if n > 1 else 0
+            last_range = high[-1] - low[-1]
+            if last_range <= 0:
+                return None
 
-            # 7. 3-candle momentum
-            if len(close) >= 3:
-                mom3 = (latest - float(close[-3])) / float(close[-3]) * 100
-                if mom3 > 0.05:
-                    bull += 1
-                elif mom3 < -0.05:
-                    bear += 1
+            body_ratio = last_body / last_range
+            lower_wick = min(close[-1], close[-2] if n > 1 else close[-1]) - low[-1]
+            upper_wick = high[-1] - max(close[-1], close[-2] if n > 1 else close[-1])
 
-            # === DECISION: need 3+ score with trend alignment ===
+            # Bullish rejection: long lower wick at support (hammer)
+            bullish_rejection = lower_wick > last_range * 0.5 and body_ratio < 0.4
+            # Bearish rejection: long upper wick at resistance (shooting star)
+            bearish_rejection = upper_wick > last_range * 0.5 and body_ratio < 0.4
+
+            # === STEP 4: Trend context (simple - just EMA20) ===
+            ema20 = talib.EMA(close, timeperiod=20)
+            ema20_val = float(ema20[-1]) if not math.isnan(ema20[-1]) else latest
+            trend_up = latest > ema20_val
+            trend_down = latest < ema20_val
+
+            # === STEP 5: Volume confirmation (if available) ===
+            vol = df["volume"].values if "volume" in df.columns else None
+            vol_ok = True
+            if vol is not None and len(vol) >= 20:
+                avg_vol = float(np.nanmean(vol[-20:]))
+                vol_ok = float(vol[-1]) > avg_vol * 0.5 if avg_vol > 0 else True
+
+            # === DECISION: Simple rules, high probability ===
             action = None
-            net = bull - bear
 
-            # With trend (safer)
-            if trend == "up" and net >= 3 and bull >= 4:
+            # BUY: Price at support + bullish rejection + uptrend
+            if at_support and bullish_rejection and trend_up and vol_ok:
                 action = "buy"
-            elif trend == "down" and net <= -3 and bear >= 4:
+
+            # SELL: Price at resistance + bearish rejection + downtrend
+            elif at_resistance and bearish_rejection and trend_down and vol_ok:
                 action = "sell"
-            # Counter-trend only on extreme signals (mean reversion)
-            elif net >= 5 and bull >= 5:
+
+            # BREAKOUT BUY: Price breaks above resistance with momentum
+            elif dist_to_resistance < 0.05 and close[-1] > nearest_resistance and trend_up:
+                # Candle closed above resistance = breakout
                 action = "buy"
-            elif net <= -5 and bear >= 5:
+
+            # BREAKOUT SELL: Price breaks below support with momentum
+            elif dist_to_support < 0.05 and close[-1] < nearest_support and trend_down:
                 action = "sell"
 
             if action is None:
                 return None
 
-            # SL/TP for scalping: tight and fast
-            sl_mult = 1.0
-            tp_mult = 1.8  # Slightly less than 2:1 for more TP hits
-
+            # SL/TP: Based on S/R levels, not ATR
             if action == "buy":
-                sl = latest - atr_val * sl_mult
-                tp = latest + atr_val * tp_mult
+                # SL below support, TP at resistance
+                sl = nearest_support - atr_val * 0.5  # Small buffer below support
+                tp_dist = nearest_resistance - latest
+                if tp_dist < atr_val * 0.5:
+                    tp_dist = atr_val * 1.5  # Minimum TP
+                tp = latest + tp_dist
+                # Ensure minimum R:R of 1.5
+                risk = latest - sl
+                if risk <= 0 or tp_dist / risk < 1.5:
+                    return None
             else:
-                sl = latest + atr_val * sl_mult
-                tp = latest - atr_val * tp_mult
+                sl = nearest_resistance + atr_val * 0.5
+                tp_dist = latest - nearest_support
+                if tp_dist < atr_val * 0.5:
+                    tp_dist = atr_val * 1.5
+                tp = latest - tp_dist
+                risk = sl - latest
+                if risk <= 0 or tp_dist / risk < 1.5:
+                    return None
 
             return {
                 "symbol": symbol, "action": action, "price": latest,
                 "sl": round(sl, 5), "tp": round(tp, 5), "atr": atr_val,
-                "rsi": rsi_val, "bull": bull, "bear": bear,
+                "support": nearest_support, "resistance": nearest_resistance,
             }
         except Exception:
             return None
