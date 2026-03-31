@@ -207,8 +207,13 @@ class ScalpBacktester:
                     if risk_dist <= 0:
                         continue
 
-                    risk_amt = equity * self.risk_per_trade
+                    # Use INITIAL balance for sizing (not equity - prevents runaway)
+                    risk_amt = self.account_size * self.risk_per_trade
                     qty = risk_amt / risk_dist
+                    # Cap quantity to prevent absurd sizes
+                    max_notional = self.account_size * 5  # Max 5x leverage
+                    max_qty = max_notional / entry if entry > 0 else 0
+                    qty = min(qty, max_qty)
 
                     # Apply spread + slippage
                     spread = SCALP_SPREADS.get(sym, 0.0002)
