@@ -163,18 +163,28 @@ class Backtester:
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
 
-                # TIME-BASED EXIT: close after 7 trading days if not at TP
+                # TIME-BASED EXIT: only close LOSING trades after 10 days
+                # Winning trades stay open until TP or SL (let winners run)
                 if pos not in positions_to_close:
                     days_held = sum(1 for d in sim_dates[:i+1]
                                    if str(d)[:10] >= pos.entry_date)
-                    if days_held >= 7:
-                        if pos.side == "long":
-                            pos.exit_price = close_price
-                            pos.pnl = (close_price - pos.entry_price) * pos.quantity
-                        else:
-                            pos.exit_price = close_price
-                            pos.pnl = (pos.entry_price - close_price) * pos.quantity
+                    if pos.side == "long":
+                        current_pnl = (close_price - pos.entry_price) * pos.quantity
+                    else:
+                        current_pnl = (pos.entry_price - close_price) * pos.quantity
+
+                    # Close losing/flat trades after 10 days (free up capital)
+                    # Keep winning trades open (let them run to TP)
+                    if days_held >= 10 and current_pnl <= 0:
+                        pos.exit_price = close_price
+                        pos.pnl = current_pnl
                         pos.exit_reason = "TIME"
+                        positions_to_close.append(pos)
+                    # Close small winners after 12 days (take partial profit)
+                    elif days_held >= 12 and current_pnl > 0:
+                        pos.exit_price = close_price
+                        pos.pnl = current_pnl
+                        pos.exit_reason = "TIME+"
                         positions_to_close.append(pos)
 
             for pos in positions_to_close:
@@ -200,6 +210,14 @@ class Backtester:
 
             # Only pause for 2 days after 3 losses, then resume
             cooldown_active = consecutive_losses >= 3 and days_since_last_trade < 2
+
+            # EQUITY DRAWDOWN PROTECTION: reduce risk when giving back profits
+            dd_from_peak = (peak - equity) / peak * 100 if peak > 0 else 0
+            risk_multiplier = 1.0
+            if dd_from_peak > 3.0:
+                risk_multiplier = 0.5  # Half size when DD > 3%
+            elif dd_from_peak > 2.0:
+                risk_multiplier = 0.75  # 75% size when DD > 2%
 
             if not cooldown_active and len(open_positions) < self.max_trades:
                 scored = []
@@ -232,8 +250,8 @@ class Backtester:
                     if risk_per_unit <= 0:
                         continue
 
-                    # Position size based on risk
-                    risk_amount = equity * self.risk_per_trade
+                    # Position size based on risk (adjusted for drawdown)
+                    risk_amount = equity * self.risk_per_trade * risk_multiplier
                     quantity = risk_amount / risk_per_unit
 
                     # Check R:R
