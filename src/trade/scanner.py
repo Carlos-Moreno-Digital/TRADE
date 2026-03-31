@@ -105,7 +105,7 @@ INDICES = [
     # === ASIA ===
     ("^N225", "index", "Nikkei 225"),
     ("^HSI", "index", "Hang Seng"),
-    ("000001.SS", "index", "Shanghai"),
+    # ("000001.SS", "index", "Shanghai"),  # Removed: bad data (NaN prices)
 ]
 
 CRYPTO = [
@@ -119,7 +119,7 @@ CRYPTO = [
     ("LINK-USD", "crypto", "Chainlink"),
     ("DOT-USD", "crypto", "Polkadot"),
     ("NEAR-USD", "crypto", "NEAR"),
-    ("SUI-USD", "crypto", "Sui"),
+    ("AAVE-USD", "crypto", "Aave"),
 ]
 
 US_STOCKS = [
@@ -471,8 +471,13 @@ class MarketScanner:
         if df.empty or len(df) < 5:
             return ScanResult(symbol, asset_class, display_name, score=0, reason="Insufficient data")
 
+        import math
         close = df["close"].values
         latest = float(close[-1])
+
+        # Guard against NaN/invalid prices
+        if math.isnan(latest) or latest <= 0:
+            return ScanResult(symbol, asset_class, display_name, score=0, reason="Invalid price")
         prev = float(close[-2])
 
         # 1-day change

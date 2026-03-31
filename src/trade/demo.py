@@ -194,14 +194,19 @@ class DemoRunner:
         # Print results table
         self._print_cycle_results(results)
 
-        # Save portfolio snapshot
+        # Save portfolio snapshot (guard against NaN from bad data)
+        import math
         portfolio = self.orchestrator.portfolio
-        self.cache.save_portfolio_snapshot(
-            cash=portfolio.cash,
-            total_value=portfolio.total_value,
-            daily_pnl=portfolio.daily_pnl,
-            drawdown_pct=portfolio.max_drawdown_pct,
-        )
+        total_val = portfolio.total_value if not math.isnan(portfolio.total_value) else portfolio.cash
+        try:
+            self.cache.save_portfolio_snapshot(
+                cash=portfolio.cash,
+                total_value=total_val,
+                daily_pnl=portfolio.daily_pnl if not math.isnan(portfolio.daily_pnl) else 0.0,
+                drawdown_pct=portfolio.max_drawdown_pct if not math.isnan(portfolio.max_drawdown_pct) else 0.0,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save snapshot: {e}")
 
         return results
 
@@ -378,6 +383,7 @@ class DemoRunner:
                 pass
 
         # Fetch latest prices for open positions directly
+        import math
         from trade.data.providers import MarketDataProvider
         provider = MarketDataProvider()
         for pos in portfolio.positions:
@@ -385,7 +391,8 @@ class DemoRunner:
                 df = provider.get_historical(pos.symbol, period="5d", interval="1d")
                 if not df.empty:
                     latest_price = float(df["close"].iloc[-1])
-                    pos.update_price(latest_price)
+                    if not math.isnan(latest_price) and latest_price > 0:
+                        pos.update_price(latest_price)
             except Exception:
                 pass
 
