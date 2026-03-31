@@ -421,10 +421,25 @@ class TradeLockerBroker(BaseBroker):
     # =========================================================================
 
     def _ensure_connected(self) -> None:
-        """Ensure we have an active connection."""
-        if not self._connected or self._tl is None:
-            if not self.connect():
-                raise ConnectionError("Not connected to TradeLocker")
+        """Ensure we have an active connection, with auto-reconnect."""
+        if self._connected and self._tl is not None:
+            return
+
+        # Try reconnecting with exponential backoff
+        delays = [2, 5, 15, 30]
+        for attempt, delay in enumerate(delays, 1):
+            logger.warning(f"Reconnecting to TradeLocker (attempt {attempt}/{len(delays)})...")
+            if self.connect():
+                logger.info(f"Reconnected on attempt {attempt}")
+                return
+            if attempt < len(delays):
+                logger.warning(f"Reconnect failed, waiting {delay}s...")
+                import time
+                time.sleep(delay)
+
+        raise ConnectionError(
+            f"Failed to connect to TradeLocker after {len(delays)} attempts"
+        )
 
     @staticmethod
     def _map_side(action: TradeAction) -> str | None:

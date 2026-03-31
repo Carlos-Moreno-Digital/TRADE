@@ -251,6 +251,7 @@ class ExecutionAgent(BaseAgent):
                 return False
 
         elif order.action in (TradeAction.SELL, TradeAction.SHORT):
+            # First try to close existing long position
             for i, pos in enumerate(portfolio.positions):
                 if pos.symbol == order.symbol and pos.side == "long":
                     pnl = (order.price - pos.entry_price) * pos.quantity
@@ -259,7 +260,29 @@ class ExecutionAgent(BaseAgent):
                     self._logger.info(f"[PAPER] Closed LONG {order.symbol}: P&L = {pnl:.2f}")
                     return True
 
-            self._logger.info(f"[PAPER] No position to close for {order.symbol}")
-            return False
+            # No long to close - open a new SHORT position (forex allows shorting)
+            margin_required = cost * 0.01  # 1% margin for forex (1:100 leverage)
+            if portfolio.cash >= margin_required:
+                portfolio.positions.append(
+                    Position(
+                        symbol=order.symbol,
+                        asset_type=order.asset_type,
+                        side="short",
+                        quantity=order.quantity,
+                        entry_price=order.price,
+                        current_price=order.price,
+                        stop_loss=order.stop_loss,
+                        take_profit=order.take_profit,
+                    )
+                )
+                self._logger.info(
+                    f"[PAPER] Opened SHORT {order.symbol}: {order.quantity:.2f} "
+                    f"@ {order.price:.5f} | SL: {order.stop_loss} | TP: {order.take_profit}"
+                )
+                return True
+            else:
+                self._logger.warning(f"[PAPER] Insufficient margin for short")
+                order.status = "rejected"
+                return False
 
         return False

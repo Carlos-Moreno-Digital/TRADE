@@ -158,6 +158,21 @@ class Orchestrator:
             except Exception as e:
                 logger.error(f"  [{agent.name}] FAILED: {e}")
 
+        # Run Smart Money analysis on available data
+        try:
+            from trade.analysis.smart_money import get_smc_analysis
+            smc_df = context.metadata.get("historical_df_1h") or context.metadata.get("historical_df")
+            if smc_df is not None and not smc_df.empty:
+                smc = get_smc_analysis(smc_df)
+                context.metadata["smc"] = smc
+                if smc.get("available"):
+                    logger.info(
+                        f"  [smc] Structure: {smc['market_structure']} | "
+                        f"OBs: {smc['active_obs']} | FVGs: {smc['active_fvgs']}"
+                    )
+        except Exception as e:
+            logger.warning(f"  [smc] Analysis failed: {e}")
+
         # Fundamental agent only for stocks
         if asset_type == AssetType.STOCK:
             try:
