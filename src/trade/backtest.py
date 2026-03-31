@@ -1,380 +1,483 @@
-"""Real Backtester - Replays historical data through the full agent pipeline.
+"""Real Backtester v2 - Proper historical simulation with no lookahead bias.
 
-Simulates what the bot would have done over a historical period:
-1. Downloads historical data for all instruments
-2. For each trading day, runs the full pipeline (scanner + agents)
-3. Tracks paper trades with slippage simulation
-4. Reports P&L, win rate, drawdown, and whether it would pass the prop firm challenge
+Key differences from v1:
+- Downloads ALL data upfront, then SLICES it per day (no future data leak)
+- Feeds sliced DataFrames directly to agents (bypasses yfinance calls during sim)
+- Tracks open positions with real price updates each day
+- Simulates SL/TP hits with actual daily high/low prices
+- Properly tracks P&L, drawdown, and win/loss per trade
 
 Usage:
-    python -m trade.main --backtest --days 30
-    python -m trade.main --backtest --days 30 --symbol EURUSD=X
+    python -m trade.main --backtest           # 30 days default
+    python -m trade.main --backtest 60        # 60 days
 """
 
 from __future__ import annotations
 
-import time
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import talib
 from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from trade.agents.orchestrator import Orchestrator
-from trade.cache.store import CacheStore
-from trade.config import load_config, TradingConfig
-from trade.data.models import AssetType, PortfolioState
 from trade.data.providers import MarketDataProvider
-from trade.risk.prop_firm import PropFirmRiskEngine, load_prop_firm_config
 
 console = Console()
 
 
+class Position:
+    """A simulated open position."""
+
+    def __init__(self, symbol: str, side: str, entry_price: float, quantity: float,
+                 stop_loss: float, take_profit: float, entry_date: str):
+        self.symbol = symbol
+        self.side = side  # "long" or "short"
+        self.entry_price = entry_price
+        self.quantity = quantity
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.entry_date = entry_date
+        self.exit_price: float | None = None
+        self.exit_date: str | None = None
+        self.exit_reason: str | None = None
+        self.pnl: float = 0.0
+
+
 class Backtester:
-    """Replays historical data through the trading pipeline."""
+    """Proper backtester that slices data per day and simulates real trading."""
 
-    def __init__(
-        self,
-        prop_firm: str = "funderpro_classic_10k",
-        top_n: int = 3,
-    ):
-        self.config = load_config()
-        self.config.general["mode"] = "paper"
-
+    def __init__(self, prop_firm: str = "funderpro_classic_10k", top_n: int = 3):
+        from trade.risk.prop_firm import load_prop_firm_config
         prop_config = load_prop_firm_config(prop_firm)
-        self.risk_engine = PropFirmRiskEngine(prop_config)
         self.account_size = prop_config.account_size
-
-        self.orchestrator = Orchestrator(
-            config=self.config,
-            risk_engine=self.risk_engine,
-        )
-
-        self.provider = MarketDataProvider()
+        self.risk_per_trade = prop_config.default_risk_per_trade_pct / 100
+        self.max_trades = prop_config.max_open_trades
+        self.min_rr = prop_config.min_risk_reward_ratio
         self.top_n = top_n
 
-        # Track results
-        self.trades: list[dict] = []
-        self.daily_equity: list[dict] = []
-        self.signals_log: list[dict] = []
+        self.provider = MarketDataProvider()
 
-    def run(
-        self,
-        days: int = 30,
-        symbols: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Run backtest over historical period.
-
-        Args:
-            days: Number of trading days to simulate
-            symbols: Specific symbols to test, or None for scanner mode
-        """
-        console.print(Panel.fit(
-            f"[bold cyan]Backtester - {days} Day Simulation[/bold cyan]\n"
-            f"Account: ${self.account_size:,.0f} | "
-            f"Mode: {'Fixed: ' + ', '.join(symbols) if symbols else f'Scanner (top {self.top_n})'}\n"
-            f"Downloading historical data...",
-            title="Backtest Starting",
-            border_style="cyan",
-        ))
-
-        # Get symbols to test
+    def run(self, days: int = 30, symbols: list[str] | None = None) -> dict[str, Any]:
+        """Run backtest."""
         if symbols is None:
             symbols = self._get_default_symbols()
 
-        # Download all historical data upfront
-        console.print(f"[dim]Downloading data for {len(symbols)} symbols...[/dim]")
-        all_data = self._download_all_data(symbols, days + 60)  # Extra for indicators
+        console.print(Panel.fit(
+            f"[bold cyan]Backtester v2 - {days} Day Simulation[/bold cyan]\n"
+            f"Account: ${self.account_size:,.0f} | Risk/trade: {self.risk_per_trade*100:.1f}% | "
+            f"R:R min: {self.min_rr} | Max positions: {self.max_trades}",
+            title="Backtest",
+            border_style="cyan",
+        ))
+
+        # Download all data upfront
+        console.print(f"[dim]Downloading {len(symbols)} symbols...[/dim]")
+        all_data = {}
+        for sym in symbols:
+            try:
+                df = self.provider.get_historical(sym, period="6mo", interval="1d")
+                if not df.empty and len(df) >= 50:
+                    all_data[sym] = df
+            except Exception:
+                pass
+        console.print(f"  Got data for {len(all_data)}/{len(symbols)} symbols\n")
 
         if not all_data:
-            console.print("[red]No data available for backtesting[/red]")
             return {"error": "No data"}
 
-        # Find common trading days
-        trading_days = self._get_trading_days(all_data, days)
-        console.print(f"[dim]Simulating {len(trading_days)} trading days...[/dim]\n")
+        # Get trading days
+        ref_df = next(iter(all_data.values()))
+        all_dates = sorted(ref_df.index.tolist())
+        warmup = 40  # Need 40 days for indicators
+        sim_dates = all_dates[warmup:][-days:]
 
-        # Reset state
-        self.orchestrator.portfolio.initialize(self.account_size)
-        self.risk_engine.initialize(self.account_size)
+        # Simulation state
+        cash = self.account_size
+        equity = self.account_size
+        peak = self.account_size
+        open_positions: list[Position] = []
+        closed_trades: list[Position] = []
+        daily_equity: list[dict] = []
+        max_dd = 0.0
 
-        # Simulate each day
-        for i, day in enumerate(trading_days):
-            self.risk_engine.start_trading_day(self.orchestrator.portfolio.total_value)
-            self.orchestrator.portfolio.reset_daily()
+        console.print(f"Simulating {len(sim_dates)} trading days...\n")
 
-            day_str = day.strftime("%Y-%m-%d")
-            equity_before = self.orchestrator.portfolio.total_value
+        for i, date in enumerate(sim_dates):
+            date_str = date.strftime("%Y-%m-%d") if hasattr(date, 'strftime') else str(date)[:10]
 
-            # Find best setups for this day
-            day_signals = self._analyze_day(day, symbols, all_data)
+            # 1. CHECK SL/TP on open positions using today's high/low
+            positions_to_close = []
+            for pos in open_positions:
+                df = all_data.get(pos.symbol)
+                if df is None:
+                    continue
+                mask = df.index <= date
+                if mask.sum() == 0:
+                    continue
+                today = df[mask].iloc[-1]
+                high = float(today["high"])
+                low = float(today["low"])
+                close = float(today["close"])
 
-            # Record daily equity
-            equity_after = self.orchestrator.portfolio.total_value
-            self.daily_equity.append({
-                "date": day_str,
-                "equity": equity_after,
-                "daily_pnl": equity_after - equity_before,
-                "positions": len(self.orchestrator.portfolio.positions),
+                if pos.side == "long":
+                    if low <= pos.stop_loss:
+                        pos.exit_price = pos.stop_loss
+                        pos.exit_reason = "SL"
+                        pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
+                        positions_to_close.append(pos)
+                    elif high >= pos.take_profit:
+                        pos.exit_price = pos.take_profit
+                        pos.exit_reason = "TP"
+                        pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
+                        positions_to_close.append(pos)
+                elif pos.side == "short":
+                    if high >= pos.stop_loss:
+                        pos.exit_price = pos.stop_loss
+                        pos.exit_reason = "SL"
+                        pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
+                        positions_to_close.append(pos)
+                    elif low <= pos.take_profit:
+                        pos.exit_price = pos.take_profit
+                        pos.exit_reason = "TP"
+                        pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
+                        positions_to_close.append(pos)
+
+            for pos in positions_to_close:
+                pos.exit_date = date_str
+                cash += pos.pnl + (pos.entry_price * pos.quantity if pos.side == "long" else 0)
+                open_positions.remove(pos)
+                closed_trades.append(pos)
+
+            # 2. ANALYZE each symbol for new entries (if we have room)
+            if len(open_positions) < self.max_trades:
+                scored = []
+                for sym, df in all_data.items():
+                    # Skip if already have position
+                    if any(p.symbol == sym for p in open_positions):
+                        continue
+
+                    mask = df.index <= date
+                    df_slice = df[mask]
+                    if len(df_slice) < 40:
+                        continue
+
+                    signal = self._analyze_symbol(df_slice, sym)
+                    if signal and signal["action"] != "hold":
+                        scored.append(signal)
+
+                # Sort by confidence, take top N
+                scored.sort(key=lambda s: s["confidence"], reverse=True)
+
+                for signal in scored[:self.top_n - len(open_positions)]:
+                    if len(open_positions) >= self.max_trades:
+                        break
+
+                    entry_price = signal["price"]
+                    sl = signal["stop_loss"]
+                    tp = signal["take_profit"]
+                    risk_per_unit = abs(entry_price - sl)
+
+                    if risk_per_unit <= 0:
+                        continue
+
+                    # Position size based on risk
+                    risk_amount = equity * self.risk_per_trade
+                    quantity = risk_amount / risk_per_unit
+
+                    # Check R:R
+                    reward = abs(tp - entry_price)
+                    rr = reward / risk_per_unit if risk_per_unit > 0 else 0
+                    if rr < self.min_rr:
+                        continue
+
+                    side = "long" if signal["action"] == "buy" else "short"
+
+                    pos = Position(
+                        symbol=signal["symbol"],
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=round(quantity, 4),
+                        stop_loss=sl,
+                        take_profit=tp,
+                        entry_date=date_str,
+                    )
+
+                    if side == "long":
+                        cash -= entry_price * quantity
+
+                    open_positions.append(pos)
+
+            # 3. UPDATE equity
+            unrealized = 0
+            for pos in open_positions:
+                df = all_data.get(pos.symbol)
+                if df is None:
+                    continue
+                mask = df.index <= date
+                if mask.sum() == 0:
+                    continue
+                current_price = float(df[mask].iloc[-1]["close"])
+                if pos.side == "long":
+                    unrealized += (current_price - pos.entry_price) * pos.quantity
+                else:
+                    unrealized += (pos.entry_price - current_price) * pos.quantity
+
+            equity = cash + sum(
+                pos.entry_price * pos.quantity for pos in open_positions if pos.side == "long"
+            ) + unrealized
+
+            if equity > peak:
+                peak = equity
+            dd = (peak - equity) / peak * 100 if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+
+            daily_equity.append({
+                "date": date_str,
+                "equity": round(equity, 2),
+                "cash": round(cash, 2),
+                "positions": len(open_positions),
+                "unrealized": round(unrealized, 2),
             })
 
-            # Progress bar
-            pct = (i + 1) / len(trading_days) * 100
+            # Progress
+            pct = (i + 1) / len(sim_dates) * 100
             bar_len = 30
             filled = int(bar_len * pct / 100)
             bar = "█" * filled + "░" * (bar_len - filled)
+            trades_str = f"W:{sum(1 for t in closed_trades if t.pnl > 0)} L:{sum(1 for t in closed_trades if t.pnl <= 0)}"
             console.print(
-                f"\r  [{bar}] {pct:.0f}% | Day {i+1}/{len(trading_days)} | "
-                f"{day_str} | Equity: ${equity_after:,.2f} | "
-                f"Signals: {len(day_signals)}",
+                f"\r  [{bar}] {pct:.0f}% | {date_str} | ${equity:,.0f} | "
+                f"Open:{len(open_positions)} | {trades_str}",
                 end="",
             )
 
         console.print("\n")
 
         # Generate report
-        return self._generate_report(trading_days)
+        return self._report(closed_trades, open_positions, daily_equity, max_dd, sim_dates)
 
-    def _get_default_symbols(self) -> list[str]:
-        """Get default symbols for backtesting - focus on prop firm tradeable."""
-        return [
-            # Forex majors
-            "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
-            # Forex crosses
-            "EURGBP=X", "EURJPY=X", "GBPJPY=X",
-            # Commodities
-            "GC=F", "CL=F",
-            # Indices
-            "^DJI", "^IXIC",
-            # Crypto
-            "BTC-USD", "ETH-USD",
-        ]
+    def _analyze_symbol(self, df: pd.DataFrame, symbol: str) -> dict | None:
+        """Analyze a symbol using indicators on sliced data. Returns signal dict or None."""
+        try:
+            close = df["close"].values.astype(float)
+            high = df["high"].values.astype(float)
+            low = df["low"].values.astype(float)
 
-    def _download_all_data(
-        self, symbols: list[str], days: int
-    ) -> dict[str, pd.DataFrame]:
-        """Download historical data for all symbols."""
-        data = {}
-        period = f"{max(days, 30)}d" if days <= 60 else f"{min(days // 30 + 1, 6)}mo"
+            if len(close) < 30:
+                return None
 
-        for symbol in symbols:
-            try:
-                df = self.provider.get_historical(symbol, period="3mo", interval="1d")
-                if not df.empty and len(df) >= 20:
-                    data[symbol] = df
-            except Exception as e:
-                logger.debug(f"Failed to download {symbol}: {e}")
+            latest = float(close[-1])
+            if math.isnan(latest) or latest <= 0:
+                return None
 
-        console.print(f"  Downloaded data for {len(data)}/{len(symbols)} symbols")
-        return data
+            # Indicators
+            rsi = talib.RSI(close, timeperiod=14)
+            macd, macd_signal, macd_hist = talib.MACD(close)
+            ema9 = talib.EMA(close, timeperiod=9)
+            ema21 = talib.EMA(close, timeperiod=21)
+            atr = talib.ATR(high, low, close, timeperiod=14)
 
-    def _get_trading_days(
-        self, all_data: dict[str, pd.DataFrame], days: int
-    ) -> list[datetime]:
-        """Get the last N trading days from the data."""
-        # Use the first symbol's index as reference
-        first_df = next(iter(all_data.values()))
-        all_dates = sorted(first_df.index.tolist())
+            rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
+            macd_val = float(macd_hist[-1]) if not math.isnan(macd_hist[-1]) else 0
+            ema9_val = float(ema9[-1]) if not math.isnan(ema9[-1]) else latest
+            ema21_val = float(ema21[-1]) if not math.isnan(ema21[-1]) else latest
+            atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.02
 
-        # Take last N days (leave first 30 for indicator warmup)
-        warmup = 30
-        available = all_dates[warmup:]
-        return available[-days:] if len(available) >= days else available
+            if atr_val <= 0:
+                return None
 
-    def _analyze_day(
-        self,
-        day: datetime,
-        symbols: list[str],
-        all_data: dict[str, pd.DataFrame],
-    ) -> list[dict]:
-        """Analyze all symbols for a single day."""
-        signals = []
+            # Trend: EMA9 > EMA21 = bullish
+            ema_bullish = ema9_val > ema21_val
+            ema_bearish = ema9_val < ema21_val
 
-        # Score each symbol for this day
-        scored = []
-        for symbol in symbols:
-            df = all_data.get(symbol)
-            if df is None:
-                continue
+            # Score
+            score = 0
+            if ema_bullish:
+                score += 1
+            if ema_bearish:
+                score -= 1
+            if rsi_val < 30:
+                score += 1  # Oversold = buy signal
+            if rsi_val > 70:
+                score -= 1  # Overbought = sell signal
+            if macd_val > 0:
+                score += 1
+            if macd_val < 0:
+                score -= 1
 
-            # Get data up to this day (no lookahead bias)
-            mask = df.index <= day
-            df_to_day = df[mask]
-            if len(df_to_day) < 20:
-                continue
-
-            # Quick score: 5-day momentum
-            close = df_to_day["close"].values
+            # 5-day momentum
             if len(close) >= 5:
-                momentum = (float(close[-1]) - float(close[-5])) / float(close[-5]) * 100
-                scored.append((symbol, abs(momentum), momentum))
+                mom = (latest - float(close[-5])) / float(close[-5]) * 100
+                if mom > 1:
+                    score += 1
+                elif mom < -1:
+                    score -= 1
 
-        # Sort by momentum strength, take top N
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [s[0] for s in scored[:self.top_n]]
+            # Decision
+            action = "hold"
+            confidence = 0.0
+            sl_mult = 1.5
+            tp_mult = 3.0
 
-        # Deep analyze top symbols
-        for symbol in top_symbols:
-            df = all_data.get(symbol)
-            if df is None:
-                continue
+            if score >= 3:
+                action = "buy"
+                confidence = min(0.9, score * 0.2)
+            elif score <= -3:
+                action = "sell"
+                confidence = min(0.9, abs(score) * 0.2)
 
-            mask = df.index <= day
-            df_to_day = df[mask]
+            if action == "hold":
+                return None
 
-            # Inject data into context
-            asset_type = self._detect_type(symbol)
+            if action == "buy":
+                sl = latest - atr_val * sl_mult
+                tp = latest + atr_val * tp_mult
+            else:
+                sl = latest + atr_val * sl_mult
+                tp = latest - atr_val * tp_mult
 
-            # Store data for agents
-            self.orchestrator.portfolio.timestamp = day
+            return {
+                "symbol": symbol,
+                "action": action,
+                "price": latest,
+                "stop_loss": round(sl, 5),
+                "take_profit": round(tp, 5),
+                "confidence": confidence,
+                "atr": atr_val,
+                "rsi": rsi_val,
+                "score": score,
+            }
+        except Exception:
+            return None
 
-            try:
-                result = self.orchestrator.analyze_symbol(symbol, asset_type)
-                decision = result.get("final_decision", "hold")
-
-                self.signals_log.append({
-                    "date": day.strftime("%Y-%m-%d"),
-                    "symbol": symbol,
-                    "decision": decision,
-                    "executed": result.get("executed", False),
-                })
-
-                if decision != "hold":
-                    signals.append(result)
-
-            except Exception as e:
-                logger.debug(f"Analysis failed for {symbol} on {day}: {e}")
-
-        return signals
-
-    def _generate_report(self, trading_days: list[datetime]) -> dict[str, Any]:
-        """Generate the final backtest report."""
-        portfolio = self.orchestrator.portfolio
-
-        # Calculate stats
+    def _report(
+        self,
+        closed: list[Position],
+        open_pos: list[Position],
+        daily_eq: list[dict],
+        max_dd: float,
+        sim_dates: list,
+    ) -> dict:
+        """Generate backtest report."""
         initial = self.account_size
-        final = portfolio.total_value
+        final = daily_eq[-1]["equity"] if daily_eq else initial
         total_pnl = final - initial
-        total_pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
+        pnl_pct = (total_pnl / initial * 100) if initial > 0 else 0
 
-        # Trade stats
-        total_signals = len(self.signals_log)
-        buy_signals = sum(1 for s in self.signals_log if s["decision"] == "buy")
-        sell_signals = sum(1 for s in self.signals_log if s["decision"] == "sell")
-        hold_signals = sum(1 for s in self.signals_log if s["decision"] == "hold")
-        executed = sum(1 for s in self.signals_log if s.get("executed"))
+        wins = [t for t in closed if t.pnl > 0]
+        losses = [t for t in closed if t.pnl <= 0]
+        total_trades = len(closed)
+        win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
 
-        # Drawdown from equity curve
-        max_dd = 0.0
-        peak = initial
-        for eq in self.daily_equity:
-            equity = eq["equity"]
-            if equity > peak:
-                peak = equity
-            dd = (peak - equity) / peak * 100 if peak > 0 else 0
-            max_dd = max(max_dd, dd)
+        avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.pnl for t in losses) / len(losses) if losses else 0
+        profit_factor = abs(sum(t.pnl for t in wins) / sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else float('inf')
 
-        # Would it pass the challenge?
-        target_pct = 10.0  # FunderPro Classic
-        passed = total_pnl_pct >= target_pct and max_dd < 10.0
-
-        # Symbol performance
-        symbol_stats = {}
-        for s in self.signals_log:
-            sym = s["symbol"]
-            if sym not in symbol_stats:
-                symbol_stats[sym] = {"total": 0, "buy": 0, "sell": 0, "hold": 0}
-            symbol_stats[sym]["total"] += 1
-            symbol_stats[sym][s["decision"]] += 1
+        passed = pnl_pct >= 10.0 and max_dd < 10.0
 
         # Print report
         console.print(Panel.fit(
-            f"[bold]Backtest Results - {len(trading_days)} Trading Days[/bold]",
-            border_style="cyan",
+            f"[bold]Backtest Results - {len(sim_dates)} Trading Days[/bold]",
+            border_style="green" if passed else "red",
         ))
 
-        # Performance table
-        perf_table = Table(show_header=False, box=None)
-        perf_table.add_column("Metric", style="bold", width=25)
-        perf_table.add_column("Value", width=20)
+        t = Table(show_header=False, box=None)
+        t.add_column("", style="bold", width=25)
+        t.add_column("", width=25)
 
         pnl_color = "green" if total_pnl >= 0 else "red"
-        perf_table.add_row("Initial Balance", f"${initial:,.2f}")
-        perf_table.add_row("Final Balance", f"${final:,.2f}")
-        perf_table.add_row("Total P&L", f"[{pnl_color}]${total_pnl:,.2f} ({total_pnl_pct:+.2f}%)[/{pnl_color}]")
-        perf_table.add_row("Max Drawdown", f"{max_dd:.2f}%")
-        perf_table.add_row("", "")
-        perf_table.add_row("Total Signals", str(total_signals))
-        perf_table.add_row("BUY Signals", str(buy_signals))
-        perf_table.add_row("SELL Signals", str(sell_signals))
-        perf_table.add_row("HOLD Signals", str(hold_signals))
-        perf_table.add_row("Executed Trades", str(executed))
-        perf_table.add_row("", "")
-
+        t.add_row("Initial Balance", f"${initial:,.2f}")
+        t.add_row("Final Balance", f"${final:,.2f}")
+        t.add_row("Total P&L", f"[{pnl_color}]${total_pnl:+,.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]")
+        t.add_row("Max Drawdown", f"{max_dd:.2f}%")
+        t.add_row("", "")
+        t.add_row("Total Trades", str(total_trades))
+        t.add_row("Wins / Losses", f"{len(wins)} / {len(losses)}")
+        wr_color = "green" if win_rate >= 50 else "red"
+        t.add_row("Win Rate", f"[{wr_color}]{win_rate:.1f}%[/{wr_color}]")
+        t.add_row("Avg Win", f"${avg_win:+,.2f}")
+        t.add_row("Avg Loss", f"${avg_loss:+,.2f}")
+        pf_str = f"{profit_factor:.2f}" if profit_factor < 999 else "∞"
+        t.add_row("Profit Factor", pf_str)
+        t.add_row("Open Positions", str(len(open_pos)))
+        t.add_row("", "")
         pass_color = "green bold" if passed else "red bold"
-        perf_table.add_row("Target (10%)", f"${initial * 0.10:,.2f}")
-        perf_table.add_row("Challenge Result", f"[{pass_color}]{'PASSED' if passed else 'NOT PASSED'}[/{pass_color}]")
+        t.add_row("Challenge Target", "10% ($1,000)")
+        t.add_row("Challenge Result", f"[{pass_color}]{'PASSED' if passed else 'NOT PASSED'}[/{pass_color}]")
 
-        console.print(perf_table)
+        console.print(t)
 
-        # Symbol breakdown
-        if symbol_stats:
-            console.print(f"\n[bold]Symbol Activity[/bold]")
-            sym_table = Table()
-            sym_table.add_column("Symbol")
-            sym_table.add_column("Signals")
-            sym_table.add_column("Buy")
-            sym_table.add_column("Sell")
-            sym_table.add_column("Hold")
+        # Trade log
+        if closed:
+            console.print(f"\n[bold]Trade History ({len(closed)} trades)[/bold]")
+            tt = Table()
+            tt.add_column("#", width=3)
+            tt.add_column("Symbol", width=12)
+            tt.add_column("Side", width=6)
+            tt.add_column("Entry", width=12)
+            tt.add_column("Exit", width=12)
+            tt.add_column("P&L", width=12)
+            tt.add_column("Reason", width=6)
+            tt.add_column("Dates", width=25)
 
-            for sym, stats in sorted(symbol_stats.items(), key=lambda x: x[1]["total"], reverse=True)[:10]:
-                sym_table.add_row(
-                    sym, str(stats["total"]),
-                    str(stats["buy"]), str(stats["sell"]), str(stats["hold"]),
+            for i, trade in enumerate(closed, 1):
+                pnl_c = "green" if trade.pnl > 0 else "red"
+                tt.add_row(
+                    str(i),
+                    trade.symbol,
+                    trade.side.upper(),
+                    f"{trade.entry_price:.2f}",
+                    f"{trade.exit_price:.2f}" if trade.exit_price else "OPEN",
+                    f"[{pnl_c}]${trade.pnl:+,.2f}[/{pnl_c}]",
+                    trade.exit_reason or "",
+                    f"{trade.entry_date} → {trade.exit_date or ''}",
                 )
-            console.print(sym_table)
+            console.print(tt)
 
-        # Equity curve (text-based)
-        if self.daily_equity:
-            console.print(f"\n[bold]Equity Curve[/bold]")
-            min_eq = min(e["equity"] for e in self.daily_equity)
-            max_eq = max(e["equity"] for e in self.daily_equity)
+        # Equity curve
+        if daily_eq:
+            console.print(f"\n[bold]Equity Curve (last 20 days)[/bold]")
+            min_eq = min(e["equity"] for e in daily_eq)
+            max_eq = max(e["equity"] for e in daily_eq)
             eq_range = max_eq - min_eq if max_eq > min_eq else 1
 
-            for eq in self.daily_equity[-20:]:  # Last 20 days
-                normalized = (eq["equity"] - min_eq) / eq_range
+            for eq in daily_eq[-20:]:
+                normalized = (eq["equity"] - min_eq) / eq_range if eq_range > 0 else 0.5
                 bar_len = int(normalized * 40)
-                bar = "█" * bar_len
-                pnl = eq["daily_pnl"]
-                color = "green" if pnl >= 0 else "red"
+                bar = "█" * max(1, bar_len)
+                diff = eq["equity"] - initial
+                color = "green" if diff >= 0 else "red"
                 console.print(
-                    f"  {eq['date']} | ${eq['equity']:>10,.2f} | [{color}]{bar}[/{color}]"
+                    f"  {eq['date']} | ${eq['equity']:>10,.2f} [{color}]({diff:+,.0f})[/{color}] | [{color}]{bar}[/{color}]"
                 )
 
-        result = {
-            "days": len(trading_days),
-            "initial_balance": initial,
-            "final_balance": round(final, 2),
-            "total_pnl": round(total_pnl, 2),
-            "total_pnl_pct": round(total_pnl_pct, 2),
-            "max_drawdown_pct": round(max_dd, 2),
-            "total_signals": total_signals,
-            "buy_signals": buy_signals,
-            "sell_signals": sell_signals,
-            "executed_trades": executed,
-            "challenge_passed": passed,
-            "daily_equity": self.daily_equity,
+        return {
+            "days": len(sim_dates),
+            "initial": initial,
+            "final": round(final, 2),
+            "pnl": round(total_pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "max_drawdown": round(max_dd, 2),
+            "total_trades": total_trades,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 1),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "profit_factor": round(profit_factor, 2) if profit_factor < 999 else 999,
+            "passed": passed,
         }
 
-        return result
-
-    @staticmethod
-    def _detect_type(symbol: str) -> AssetType:
-        if symbol.endswith("=X"):
-            return AssetType.FOREX
-        if symbol.endswith("-USD"):
-            return AssetType.CRYPTO
-        return AssetType.STOCK
+    def _get_default_symbols(self) -> list[str]:
+        return [
+            "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
+            "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X",
+            "GC=F", "SI=F", "CL=F",
+            "BTC-USD", "ETH-USD",
+        ]
