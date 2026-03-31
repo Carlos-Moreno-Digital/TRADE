@@ -55,6 +55,12 @@ class Orchestrator:
 
         # Portfolio state
         initial_capital = config.portfolio.initial_capital
+        # Use prop firm account size if available, otherwise config default
+        if risk_engine and hasattr(risk_engine.config, 'account_size') and risk_engine.config.account_size:
+            initial_capital = risk_engine.config.account_size
+        else:
+            initial_capital = config.portfolio.initial_capital
+
         self.portfolio = PortfolioState()
         self.portfolio.initialize(initial_capital)
 
@@ -110,7 +116,15 @@ class Orchestrator:
                 logger.warning(f"PROP FIRM BLOCK: {reason}")
                 return self._make_skip_result(symbol, asset_type, f"Prop firm: {reason}", start)
 
-        # Check 2: Session and kill zone awareness
+        # Check 2: Already have position on this symbol?
+        existing_position = any(
+            pos.symbol == symbol for pos in self.portfolio.positions
+        )
+        if existing_position:
+            logger.info(f"Already have position in {symbol} - skipping")
+            return self._make_skip_result(symbol, asset_type, f"Already positioned in {symbol}", start)
+
+        # Check 3: Session and kill zone awareness
         now_utc = datetime.now(timezone.utc)
         session = get_current_session(now_utc)
         kill_zone = get_active_kill_zone(now_utc)

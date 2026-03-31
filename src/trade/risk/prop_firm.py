@@ -23,6 +23,7 @@ class PropFirmConfig(BaseModel):
 
     name: str = "funderpro"
     phase: str = "challenge_1"  # challenge_1, challenge_2, funded
+    account_size: float = 10000.0  # Account size in dollars
 
     # Actual firm limits
     firm_profit_target_pct: float = 8.0

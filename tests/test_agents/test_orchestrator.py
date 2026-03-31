@@ -31,11 +31,12 @@ class TestOrchestratorInit:
         assert orchestrator.risk_engine is risk_engine
 
     def test_portfolio_initialized(self, orchestrator):
-        assert orchestrator.portfolio.total_value == 100000.0
-        assert orchestrator.portfolio.cash == 100000.0
+        # Uses prop firm account_size ($10K) instead of config default ($100K)
+        assert orchestrator.portfolio.total_value == 10000.0
+        assert orchestrator.portfolio.cash == 10000.0
 
     def test_risk_engine_initialized(self, orchestrator):
-        assert orchestrator.risk_engine._initial_balance == 100000.0
+        assert orchestrator.risk_engine._initial_balance == 10000.0
 
 
 class TestRiskVetoAbsolute:
