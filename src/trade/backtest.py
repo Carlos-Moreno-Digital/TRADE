@@ -52,13 +52,13 @@ class Position:
 class Backtester:
     """Proper backtester that slices data per day and simulates real trading."""
 
-    def __init__(self, prop_firm: str = "funderpro_classic_10k", top_n: int = 3):
+    def __init__(self, prop_firm: str = "funderpro_classic_10k", top_n: int = 5):
         from trade.risk.prop_firm import load_prop_firm_config
         prop_config = load_prop_firm_config(prop_firm)
         self.account_size = prop_config.account_size
-        self.risk_per_trade = prop_config.default_risk_per_trade_pct / 100
-        self.max_trades = prop_config.max_open_trades
-        self.min_rr = prop_config.min_risk_reward_ratio
+        self.risk_per_trade = 0.0075  # 0.75% per trade (prop firm max)
+        self.max_trades = 3           # Up to 3 concurrent positions
+        self.min_rr = 1.5             # Minimum 1.5:1 risk:reward
         self.top_n = top_n
 
         self.provider = MarketDataProvider()
@@ -263,7 +263,7 @@ class Backtester:
         return self._report(closed_trades, open_positions, daily_equity, max_dd, sim_dates)
 
     def _analyze_symbol(self, df: pd.DataFrame, symbol: str) -> dict | None:
-        """Analyze a symbol using indicators on sliced data. Returns signal dict or None."""
+        """Analyze a symbol for prop firm trading. More signals, tighter SL/TP."""
         try:
             close = df["close"].values.astype(float)
             high = df["high"].values.astype(float)
@@ -276,64 +276,110 @@ class Backtester:
             if math.isnan(latest) or latest <= 0:
                 return None
 
-            # Indicators
+            # === INDICATORS ===
             rsi = talib.RSI(close, timeperiod=14)
-            macd, macd_signal, macd_hist = talib.MACD(close)
+            macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
             ema9 = talib.EMA(close, timeperiod=9)
             ema21 = talib.EMA(close, timeperiod=21)
+            ema50 = talib.EMA(close, timeperiod=50)
             atr = talib.ATR(high, low, close, timeperiod=14)
+            stoch_k, stoch_d = talib.STOCH(high, low, close)
+            upper, middle, lower = talib.BBANDS(close, timeperiod=20)
 
             rsi_val = float(rsi[-1]) if not math.isnan(rsi[-1]) else 50
             macd_val = float(macd_hist[-1]) if not math.isnan(macd_hist[-1]) else 0
+            macd_prev = float(macd_hist[-2]) if len(macd_hist) > 1 and not math.isnan(macd_hist[-2]) else 0
             ema9_val = float(ema9[-1]) if not math.isnan(ema9[-1]) else latest
             ema21_val = float(ema21[-1]) if not math.isnan(ema21[-1]) else latest
+            ema50_val = float(ema50[-1]) if not math.isnan(ema50[-1]) else latest
             atr_val = float(atr[-1]) if not math.isnan(atr[-1]) else latest * 0.02
+            stoch_val = float(stoch_k[-1]) if not math.isnan(stoch_k[-1]) else 50
+            bb_upper = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.02
+            bb_lower = float(lower[-1]) if not math.isnan(lower[-1]) else latest * 0.98
 
             if atr_val <= 0:
                 return None
 
-            # Trend: EMA9 > EMA21 = bullish
-            ema_bullish = ema9_val > ema21_val
-            ema_bearish = ema9_val < ema21_val
+            # === SCORING (more granular, 0-10 scale) ===
+            bull_score = 0
+            bear_score = 0
 
-            # Score
-            score = 0
-            if ema_bullish:
-                score += 1
-            if ema_bearish:
-                score -= 1
-            if rsi_val < 30:
-                score += 1  # Oversold = buy signal
-            if rsi_val > 70:
-                score -= 1  # Overbought = sell signal
+            # Trend (EMA alignment)
+            if ema9_val > ema21_val > ema50_val:
+                bull_score += 2  # Strong uptrend
+            elif ema9_val > ema21_val:
+                bull_score += 1  # Moderate uptrend
+            if ema9_val < ema21_val < ema50_val:
+                bear_score += 2  # Strong downtrend
+            elif ema9_val < ema21_val:
+                bear_score += 1
+
+            # RSI
+            if rsi_val < 35:
+                bull_score += 1  # Oversold zone
+            if rsi_val < 25:
+                bull_score += 1  # Deep oversold
+            if rsi_val > 65:
+                bear_score += 1
+            if rsi_val > 75:
+                bear_score += 1
+
+            # MACD momentum + crossover
             if macd_val > 0:
-                score += 1
+                bull_score += 1
             if macd_val < 0:
-                score -= 1
+                bear_score += 1
+            # MACD crossover (histogram flips sign)
+            if macd_prev <= 0 < macd_val:
+                bull_score += 2  # Bullish crossover = strong signal
+            if macd_prev >= 0 > macd_val:
+                bear_score += 2  # Bearish crossover
 
-            # 5-day momentum
+            # Stochastic
+            if stoch_val < 25:
+                bull_score += 1
+            if stoch_val > 75:
+                bear_score += 1
+
+            # Bollinger Bands
+            if latest <= bb_lower:
+                bull_score += 1  # Price at lower band = bounce
+            if latest >= bb_upper:
+                bear_score += 1
+
+            # Momentum (3-day and 5-day)
             if len(close) >= 5:
-                mom = (latest - float(close[-5])) / float(close[-5]) * 100
-                if mom > 1:
-                    score += 1
-                elif mom < -1:
-                    score -= 1
+                mom5 = (latest - float(close[-5])) / float(close[-5]) * 100
+                if mom5 > 0.5:
+                    bull_score += 1
+                elif mom5 < -0.5:
+                    bear_score += 1
+            if len(close) >= 3:
+                mom3 = (latest - float(close[-3])) / float(close[-3]) * 100
+                if mom3 > 0.3:
+                    bull_score += 1
+                elif mom3 < -0.3:
+                    bear_score += 1
 
-            # Decision
+            # === DECISION ===
             action = "hold"
             confidence = 0.0
-            sl_mult = 1.5
-            tp_mult = 3.0
+            net_score = bull_score - bear_score
 
-            if score >= 3:
+            # Score >= 2 = trade (was 3 - now more active)
+            if net_score >= 2 and bull_score >= 3:
                 action = "buy"
-                confidence = min(0.9, score * 0.2)
-            elif score <= -3:
+                confidence = min(0.9, bull_score * 0.12)
+            elif net_score <= -2 and bear_score >= 3:
                 action = "sell"
-                confidence = min(0.9, abs(score) * 0.2)
+                confidence = min(0.9, bear_score * 0.12)
 
             if action == "hold":
                 return None
+
+            # === TIGHTER SL/TP for prop firm (more trades, smaller moves) ===
+            sl_mult = 1.2   # Tighter SL (was 1.5) = less risk per trade
+            tp_mult = 2.0   # TP at 2x risk (was 3x) = hits more often
 
             if action == "buy":
                 sl = latest - atr_val * sl_mult
@@ -351,7 +397,9 @@ class Backtester:
                 "confidence": confidence,
                 "atr": atr_val,
                 "rsi": rsi_val,
-                "score": score,
+                "bull_score": bull_score,
+                "bear_score": bear_score,
+                "net_score": net_score,
             }
         except Exception:
             return None
@@ -476,8 +524,12 @@ class Backtester:
 
     def _get_default_symbols(self) -> list[str]:
         return [
+            # Forex majors + crosses (most liquid, tightest spreads)
             "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
-            "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X",
+            "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X", "EURAUD=X",
+            "GBPAUD=X", "GBPNZD=X", "AUDJPY=X", "NZDJPY=X", "CADJPY=X",
+            # Commodities
             "GC=F", "SI=F", "CL=F",
+            # Crypto
             "BTC-USD", "ETH-USD",
         ]
