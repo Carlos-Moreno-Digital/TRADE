@@ -1,0 +1,63 @@
+# FunderPro CLASSIC $10K Challenge - TEST Account
+# Cost: $82 (with discount) | No add-ons
+# Purpose: Validate bot in real conditions before $25K attempt
+
+name: funderpro_classic_10k
+phase: challenge_1
+
+account_size: 10000
+challenge_cost: 82
+
+# Actual FunderPro Classic $10K limits
+firm_profit_target_pct: 10.0       # $1,000
+firm_profit_target_phase2_pct: 5.0 # $500
+firm_max_daily_loss_pct: 5.0       # $500
+firm_max_total_drawdown_pct: 10.0  # $1,000
+firm_min_trading_days: 4
+firm_time_limit_days: 0            # Unlimited
+firm_consistency_rule: false
+
+# Safety buffers
+max_daily_loss_pct: 4.0            # $400 (firm: $500)
+max_total_drawdown_pct: 8.0        # $800 (firm: $1,000)
+hard_stop_daily_pct: 3.0           # $300
+hard_stop_drawdown_pct: 7.0        # $700
+
+# Position sizing for $10K
+# 0.5% risk = $50 per trade
+# Need ~20 trades with 1:2 RR at 50% win rate to hit $1,000
+max_risk_per_trade_pct: 0.75       # Max: $75
+default_risk_per_trade_pct: 0.5    # Default: $50
+max_open_trades: 2                 # Conservative for $10K
+max_lots_per_trade: 1.0
+
+min_risk_reward_ratio: 1.5
+target_risk_reward_ratio: 2.0
+
+consistency_max_day_pct: 35.0
+max_trades_per_day: 4
+min_trades_for_target: 15
+
+# No add-ons
+news_trading_allowed: true
+news_blackout_minutes: 5           # More conservative without Swing
+weekend_holding_allowed: false     # No Swing add-on
+ea_trading_allowed: true
+hedging_allowed: true
+martingale_allowed: false
+grid_trading_allowed: false
+
+leverage_forex: 100
+leverage_metals: 30
+leverage_indices: 30
+leverage_crypto: 2
+leverage_stocks: 5
+
+allowed_sessions:
+  - london
+  - new_york
+  - london_ny_overlap
+
+consecutive_loss_cooldown_minutes: 60
+consecutive_loss_threshold: 2
+daily_loss_cooldown_until_next_day: true
