@@ -30,7 +30,7 @@ console = Console()
 # =========================================================================
 
 FOREX_PAIRS = [
-    # Majors
+    # === MAJORS (7) - Most liquid, tightest spreads ===
     ("EURUSD=X", "forex", "EUR/USD"),
     ("GBPUSD=X", "forex", "GBP/USD"),
     ("USDJPY=X", "forex", "USD/JPY"),
@@ -38,36 +38,173 @@ FOREX_PAIRS = [
     ("AUDUSD=X", "forex", "AUD/USD"),
     ("NZDUSD=X", "forex", "NZD/USD"),
     ("USDCAD=X", "forex", "USD/CAD"),
-    # Crosses
+    # === EUR CROSSES (6) ===
     ("EURGBP=X", "forex", "EUR/GBP"),
     ("EURJPY=X", "forex", "EUR/JPY"),
-    ("GBPJPY=X", "forex", "GBP/JPY"),
-    ("AUDJPY=X", "forex", "AUD/JPY"),
     ("EURAUD=X", "forex", "EUR/AUD"),
-    ("GBPAUD=X", "forex", "GBP/AUD"),
     ("EURNZD=X", "forex", "EUR/NZD"),
+    ("EURCHF=X", "forex", "EUR/CHF"),
+    ("EURCAD=X", "forex", "EUR/CAD"),
+    # === GBP CROSSES (5) ===
+    ("GBPJPY=X", "forex", "GBP/JPY"),
+    ("GBPAUD=X", "forex", "GBP/AUD"),
     ("GBPNZD=X", "forex", "GBP/NZD"),
+    ("GBPCAD=X", "forex", "GBP/CAD"),
+    ("GBPCHF=X", "forex", "GBP/CHF"),
+    # === JPY CROSSES (4) ===
+    ("AUDJPY=X", "forex", "AUD/JPY"),
+    ("NZDJPY=X", "forex", "NZD/JPY"),
+    ("CADJPY=X", "forex", "CAD/JPY"),
+    ("CHFJPY=X", "forex", "CHF/JPY"),
+    # === OTHER CROSSES (5) ===
+    ("AUDNZD=X", "forex", "AUD/NZD"),
+    ("AUDCAD=X", "forex", "AUD/CAD"),
+    ("AUDCHF=X", "forex", "AUD/CHF"),
     ("CADCHF=X", "forex", "CAD/CHF"),
+    ("NZDCAD=X", "forex", "NZD/CAD"),
+    # === EXOTICS (6) ===
+    ("USDMXN=X", "forex", "USD/MXN"),
+    ("USDZAR=X", "forex", "USD/ZAR"),
+    ("USDSGD=X", "forex", "USD/SGD"),
+    ("USDHKD=X", "forex", "USD/HKD"),
+    ("USDNOK=X", "forex", "USD/NOK"),
+    ("USDSEK=X", "forex", "USD/SEK"),
 ]
 
 COMMODITIES = [
+    # === PRECIOUS METALS ===
     ("GC=F", "commodity", "Gold"),
     ("SI=F", "commodity", "Silver"),
+    ("PL=F", "commodity", "Platinum"),
+    # === ENERGY ===
     ("CL=F", "commodity", "Oil WTI"),
+    ("BZ=F", "commodity", "Oil Brent"),
+    ("NG=F", "commodity", "Natural Gas"),
+    # === AGRICULTURE ===
+    ("ZC=F", "commodity", "Corn"),
+    ("ZW=F", "commodity", "Wheat"),
+    ("ZS=F", "commodity", "Soybeans"),
+    ("KC=F", "commodity", "Coffee"),
+    # === INDUSTRIAL ===
+    ("HG=F", "commodity", "Copper"),
 ]
 
 INDICES = [
+    # === US ===
     ("^DJI", "index", "Dow Jones"),
     ("^IXIC", "index", "Nasdaq"),
     ("^GSPC", "index", "S&P 500"),
-    ("^GDAXI", "index", "DAX"),
+    ("^RUT", "index", "Russell 2000"),
+    ("^VIX", "index", "VIX Fear"),
+    # === EUROPE ===
+    ("^GDAXI", "index", "DAX 40"),
     ("^FTSE", "index", "FTSE 100"),
+    ("^FCHI", "index", "CAC 40"),
+    ("^IBEX", "index", "IBEX 35"),
+    ("^STOXX50E", "index", "Euro Stoxx 50"),
+    # === ASIA ===
+    ("^N225", "index", "Nikkei 225"),
+    ("^HSI", "index", "Hang Seng"),
+    ("000001.SS", "index", "Shanghai"),
 ]
 
 CRYPTO = [
     ("BTC-USD", "crypto", "Bitcoin"),
     ("ETH-USD", "crypto", "Ethereum"),
     ("SOL-USD", "crypto", "Solana"),
+    ("ADA-USD", "crypto", "Cardano"),
+    ("XRP-USD", "crypto", "Ripple"),
+    ("DOGE-USD", "crypto", "Dogecoin"),
+    ("AVAX-USD", "crypto", "Avalanche"),
+    ("LINK-USD", "crypto", "Chainlink"),
+    ("DOT-USD", "crypto", "Polkadot"),
+    ("MATIC-USD", "crypto", "Polygon"),
+    ("NEAR-USD", "crypto", "NEAR"),
+    ("UNI-USD", "crypto", "Uniswap"),
+]
+
+US_STOCKS = [
+    # === MEGA CAPS (highest liquidity) ===
+    ("AAPL", "stock_us", "Apple"),
+    ("MSFT", "stock_us", "Microsoft"),
+    ("GOOGL", "stock_us", "Google"),
+    ("AMZN", "stock_us", "Amazon"),
+    ("NVDA", "stock_us", "NVIDIA"),
+    ("META", "stock_us", "Meta"),
+    ("TSLA", "stock_us", "Tesla"),
+    ("BRK-B", "stock_us", "Berkshire"),
+    ("JPM", "stock_us", "JP Morgan"),
+    ("V", "stock_us", "Visa"),
+    # === TECH ===
+    ("AMD", "stock_us", "AMD"),
+    ("CRM", "stock_us", "Salesforce"),
+    ("NFLX", "stock_us", "Netflix"),
+    ("AVGO", "stock_us", "Broadcom"),
+    ("ORCL", "stock_us", "Oracle"),
+    ("ADBE", "stock_us", "Adobe"),
+    ("INTC", "stock_us", "Intel"),
+    ("PLTR", "stock_us", "Palantir"),
+    # === FINANCE ===
+    ("BAC", "stock_us", "BoA"),
+    ("GS", "stock_us", "Goldman"),
+    ("MS", "stock_us", "Morgan St"),
+    ("C", "stock_us", "Citigroup"),
+    # === HEALTHCARE ===
+    ("UNH", "stock_us", "UnitedH"),
+    ("JNJ", "stock_us", "J&J"),
+    ("LLY", "stock_us", "Eli Lilly"),
+    ("PFE", "stock_us", "Pfizer"),
+    # === CONSUMER ===
+    ("WMT", "stock_us", "Walmart"),
+    ("KO", "stock_us", "Coca-Cola"),
+    ("MCD", "stock_us", "McDonalds"),
+    ("NKE", "stock_us", "Nike"),
+    # === ENERGY ===
+    ("XOM", "stock_us", "Exxon"),
+    ("CVX", "stock_us", "Chevron"),
+    # === POPULAR/VOLATILE ===
+    ("COIN", "stock_us", "Coinbase"),
+    ("SQ", "stock_us", "Block/SQ"),
+    ("RIVN", "stock_us", "Rivian"),
+    ("SOFI", "stock_us", "SoFi"),
+]
+
+EU_STOCKS = [
+    # === SPAIN (IBEX) ===
+    ("SAN.MC", "stock_eu", "Santander"),
+    ("BBVA.MC", "stock_eu", "BBVA"),
+    ("ITX.MC", "stock_eu", "Inditex"),
+    ("TEF.MC", "stock_eu", "Telefonica"),
+    ("IBE.MC", "stock_eu", "Iberdrola"),
+    ("REP.MC", "stock_eu", "Repsol"),
+    # === GERMANY ===
+    ("SAP.DE", "stock_eu", "SAP"),
+    ("SIE.DE", "stock_eu", "Siemens"),
+    ("BMW.DE", "stock_eu", "BMW"),
+    # === FRANCE ===
+    ("MC.PA", "stock_eu", "LVMH"),
+    ("TTE.PA", "stock_eu", "TotalEnerg"),
+    ("OR.PA", "stock_eu", "L'Oreal"),
+    # === UK ===
+    ("SHEL.L", "stock_eu", "Shell"),
+    ("HSBA.L", "stock_eu", "HSBC"),
+    ("AZN.L", "stock_eu", "AstraZ"),
+]
+
+ETFS = [
+    ("SPY", "etf", "S&P 500 ETF"),
+    ("QQQ", "etf", "Nasdaq ETF"),
+    ("IWM", "etf", "Russell 2k"),
+    ("GLD", "etf", "Gold ETF"),
+    ("SLV", "etf", "Silver ETF"),
+    ("TLT", "etf", "Bond 20Y"),
+    ("USO", "etf", "Oil ETF"),
+    ("EEM", "etf", "Emerging Mk"),
+    ("XLF", "etf", "Financial"),
+    ("XLE", "etf", "Energy"),
+    ("XLK", "etf", "Tech"),
+    ("ARKK", "etf", "ARK Innov"),
+    ("VXX", "etf", "Volatility"),
 ]
 
 # Market hours (UTC) - None means 24 hours
@@ -75,7 +212,7 @@ MARKET_HOURS: dict[str, dict[str, Any]] = {
     "forex": {
         "open_utc": (22, 0),   # Sunday 22:00 UTC
         "close_utc": (22, 0),  # Friday 22:00 UTC
-        "days": [0, 1, 2, 3, 4],  # Mon-Fri (Sun evening open handled separately)
+        "days": [0, 1, 2, 3, 4],
         "is_24h": True,
         "note": "24/5 - closed weekends",
     },
@@ -83,20 +220,41 @@ MARKET_HOURS: dict[str, dict[str, Any]] = {
         "open_utc": (22, 0),
         "close_utc": (21, 0),
         "days": [0, 1, 2, 3, 4],
-        "is_24h": True,  # Nearly 24h with short breaks
+        "is_24h": True,
         "note": "Nearly 24/5 with 1h daily break",
     },
     "index": {
-        "open_utc": (14, 30),  # US market open
+        "open_utc": (13, 30),  # Pre-market opens ~13:30 UTC
         "close_utc": (21, 0),  # US market close
         "days": [0, 1, 2, 3, 4],
         "is_24h": False,
-        "note": "US hours 14:30-21:00 UTC (futures trade longer)",
+        "note": "US hours 13:30-21:00 UTC",
+    },
+    "stock_us": {
+        "open_utc": (14, 30),  # NYSE/Nasdaq open 14:30 UTC
+        "close_utc": (21, 0),  # Close 21:00 UTC
+        "days": [0, 1, 2, 3, 4],
+        "is_24h": False,
+        "note": "US stocks 14:30-21:00 UTC (09:30-16:00 ET)",
+    },
+    "stock_eu": {
+        "open_utc": (7, 0),    # EU markets open ~07:00-08:00 UTC
+        "close_utc": (16, 30), # Close ~16:30 UTC
+        "days": [0, 1, 2, 3, 4],
+        "is_24h": False,
+        "note": "EU stocks 07:00-16:30 UTC",
+    },
+    "etf": {
+        "open_utc": (14, 30),  # Same as US stocks
+        "close_utc": (21, 0),
+        "days": [0, 1, 2, 3, 4],
+        "is_24h": False,
+        "note": "ETFs follow US market hours",
     },
     "crypto": {
         "open_utc": (0, 0),
         "close_utc": (23, 59),
-        "days": [0, 1, 2, 3, 4, 5, 6],  # 24/7
+        "days": [0, 1, 2, 3, 4, 5, 6],
         "is_24h": True,
         "note": "24/7 - never closes",
     },
@@ -147,12 +305,17 @@ class MarketScanner:
 
         active = []
 
-        for instruments, asset_class in [
+        all_instruments = [
             (FOREX_PAIRS, "forex"),
             (COMMODITIES, "commodity"),
             (INDICES, "index"),
+            (US_STOCKS, "stock_us"),
+            (EU_STOCKS, "stock_eu"),
+            (ETFS, "etf"),
             (CRYPTO, "crypto"),
-        ]:
+        ]
+
+        for instruments, asset_class in all_instruments:
             hours = MARKET_HOURS[asset_class]
 
             # Check day

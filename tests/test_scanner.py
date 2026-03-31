@@ -9,6 +9,9 @@ from trade.scanner import (
     COMMODITIES,
     INDICES,
     CRYPTO,
+    US_STOCKS,
+    EU_STOCKS,
+    ETFS,
     MARKET_HOURS,
     ScanResult,
 )
@@ -27,10 +30,18 @@ class TestMarketHours:
         assert MARKET_HOURS["index"]["is_24h"] is False
 
     def test_instruments_defined(self):
-        assert len(FOREX_PAIRS) >= 10
-        assert len(COMMODITIES) >= 2
-        assert len(INDICES) >= 3
-        assert len(CRYPTO) >= 2
+        assert len(FOREX_PAIRS) >= 30
+        assert len(COMMODITIES) >= 8
+        assert len(INDICES) >= 10
+        assert len(CRYPTO) >= 10
+        assert len(US_STOCKS) >= 30
+        assert len(EU_STOCKS) >= 10
+        assert len(ETFS) >= 10
+
+    def test_total_universe_150_plus(self):
+        total = len(FOREX_PAIRS) + len(COMMODITIES) + len(INDICES) + \
+                len(CRYPTO) + len(US_STOCKS) + len(EU_STOCKS) + len(ETFS)
+        assert total >= 130
 
 
 class TestMarketScanner:
@@ -44,10 +55,13 @@ class TestMarketScanner:
         scanner = MarketScanner()
         active = scanner.get_active_instruments(tuesday_15h)
 
-        # Forex, commodities, indices, crypto should all be open
+        # Forex, commodities, indices, stocks, crypto should all be open
         asset_classes = set(cls for _, cls, _ in active)
         assert "forex" in asset_classes
         assert "crypto" in asset_classes
+        assert "stock_us" in asset_classes
+        # Should be 100+ instruments during US hours
+        assert len(active) >= 100
 
     def test_no_forex_on_saturday(self):
         """Forex should be closed on Saturday."""
