@@ -125,19 +125,19 @@ class Backtester:
                 low = float(today["low"])
                 close_price = float(today["close"])
 
-                # TRAILING STOP: move SL to breakeven when price moves 1x risk in our favor
+                # TRAILING STOP: less aggressive - let winners run
                 risk_dist = abs(pos.entry_price - pos.stop_loss)
                 if pos.side == "long":
-                    # If price is 1x risk above entry, move SL to entry (breakeven)
-                    if close_price >= pos.entry_price + risk_dist and pos.stop_loss < pos.entry_price:
-                        pos.stop_loss = pos.entry_price + risk_dist * 0.1  # Tiny profit lock
-                    # If price is 1.5x risk above, trail SL to 0.5x risk above entry
-                    if close_price >= pos.entry_price + risk_dist * 1.5 and pos.stop_loss < pos.entry_price + risk_dist * 0.5:
+                    # Move SL to breakeven only when price reaches 1.5x risk (not 1x)
+                    if close_price >= pos.entry_price + risk_dist * 1.5 and pos.stop_loss < pos.entry_price:
+                        pos.stop_loss = pos.entry_price + risk_dist * 0.1
+                    # Trail SL further only at 2x risk
+                    if close_price >= pos.entry_price + risk_dist * 2.0 and pos.stop_loss < pos.entry_price + risk_dist * 0.5:
                         pos.stop_loss = pos.entry_price + risk_dist * 0.5
                 elif pos.side == "short":
-                    if close_price <= pos.entry_price - risk_dist and pos.stop_loss > pos.entry_price:
+                    if close_price <= pos.entry_price - risk_dist * 1.5 and pos.stop_loss > pos.entry_price:
                         pos.stop_loss = pos.entry_price - risk_dist * 0.1
-                    if close_price <= pos.entry_price - risk_dist * 1.5 and pos.stop_loss > pos.entry_price - risk_dist * 0.5:
+                    if close_price <= pos.entry_price - risk_dist * 2.0 and pos.stop_loss > pos.entry_price - risk_dist * 0.5:
                         pos.stop_loss = pos.entry_price - risk_dist * 0.5
 
                 if pos.side == "long":
@@ -169,8 +169,18 @@ class Backtester:
                 open_positions.remove(pos)
                 closed_trades.append(pos)
 
-            # 2. ANALYZE each symbol for new entries (if we have room)
-            if len(open_positions) < self.max_trades:
+            # 2. CHECK consecutive losses - cooldown after 3 in a row
+            recent_trades = closed_trades[-5:] if closed_trades else []
+            consecutive_losses = 0
+            for t in reversed(recent_trades):
+                if t.pnl < 0:
+                    consecutive_losses += 1
+                else:
+                    break
+            if consecutive_losses >= 3:
+                # Skip new entries - wait for market conditions to change
+                pass
+            elif len(open_positions) < self.max_trades:
                 scored = []
                 for sym, df in all_data.items():
                     # Skip if already have position
