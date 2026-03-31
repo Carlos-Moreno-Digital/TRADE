@@ -1,0 +1,62 @@
+# Example: Trend Following + Mean Reversion Hybrid Strategy
+name: hybrid_trend_reversion
+description: >
+  Combines trend following on higher timeframes with mean reversion
+  entries on lower timeframes. Uses sentiment as confirmation filter.
+
+# Target assets
+assets:
+  - symbol: AAPL
+    type: stock
+  - symbol: BTC-USD
+    type: crypto
+  - symbol: EURUSD=X
+    type: forex
+
+# Entry conditions (ALL must be true)
+entry:
+  long:
+    - indicator: EMA_50
+      condition: price_above
+      description: "Price above 50 EMA (uptrend)"
+    - indicator: RSI
+      condition: below
+      value: 40
+      description: "RSI below 40 (oversold in uptrend = mean reversion entry)"
+    - indicator: MACD
+      condition: histogram_positive
+      description: "MACD histogram turning positive"
+    - sentiment: bullish_or_neutral
+      description: "Sentiment not bearish"
+
+  short:
+    - indicator: EMA_50
+      condition: price_below
+      description: "Price below 50 EMA (downtrend)"
+    - indicator: RSI
+      condition: above
+      value: 60
+      description: "RSI above 60 (overbought in downtrend)"
+    - indicator: MACD
+      condition: histogram_negative
+      description: "MACD histogram turning negative"
+
+# Exit conditions (ANY triggers exit)
+exit:
+  take_profit:
+    method: atr_multiple
+    multiplier: 3.0
+  stop_loss:
+    method: atr_multiple
+    multiplier: 1.5
+  trailing_stop:
+    enabled: true
+    method: atr_multiple
+    multiplier: 2.0
+  time_based:
+    max_hold_days: 10
+
+# Position sizing
+position_sizing:
+  method: volatility_adjusted  # fixed_pct | kelly | volatility_adjusted
+  base_risk_pct: 1.0  # Risk 1% of portfolio per trade

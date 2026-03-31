@@ -1,0 +1,133 @@
+# ===========================================
+# TRADE - Default Configuration
+# ===========================================
+
+general:
+  mode: paper  # paper | live
+  log_level: INFO
+  timezone: UTC
+  base_currency: USD
+
+# Autonomous trading settings
+autonomous:
+  enabled: true
+  scan_interval_seconds: 300  # 5 minutes between scans
+  max_concurrent_analyses: 5
+  require_confirmation_for_live: true
+
+# Market configuration
+markets:
+  stocks:
+    enabled: true
+    provider: yfinance  # yfinance | openbb
+    watchlist:
+      - AAPL
+      - MSFT
+      - GOOGL
+      - AMZN
+      - TSLA
+      - NVDA
+      - META
+      - SPY
+      - QQQ
+    trading_hours:
+      start: "09:30"
+      end: "16:00"
+      timezone: "US/Eastern"
+
+  crypto:
+    enabled: true
+    provider: yfinance  # yfinance | ccxt
+    watchlist:
+      - BTC-USD
+      - ETH-USD
+      - SOL-USD
+      - ADA-USD
+    trading_hours: null  # 24/7
+
+  forex:
+    enabled: true
+    provider: yfinance
+    watchlist:
+      - EURUSD=X
+      - GBPUSD=X
+      - USDJPY=X
+      - AUDUSD=X
+    trading_hours:
+      start: "00:00"
+      end: "23:59"
+      timezone: UTC
+
+# Risk management (CRITICAL - DO NOT WEAKEN)
+risk:
+  max_portfolio_drawdown_pct: 10.0
+  max_daily_loss_pct: 3.0
+  max_per_trade_loss_pct: 2.0
+  max_position_pct: 5.0
+  max_trades_per_hour: 10
+  consecutive_loss_cooldown_hours: 1.0
+  consecutive_loss_threshold: 3
+  max_open_positions: 10
+  min_risk_reward_ratio: 2.0
+
+# Technical analysis settings
+technical:
+  indicators:
+    - name: RSI
+      period: 14
+      overbought: 70
+      oversold: 30
+    - name: MACD
+      fast: 12
+      slow: 26
+      signal: 9
+    - name: BBANDS
+      period: 20
+      std_dev: 2.0
+    - name: ATR
+      period: 14
+    - name: EMA
+      periods: [9, 21, 50, 200]
+    - name: VWAP
+    - name: STOCH
+      k_period: 14
+      d_period: 3
+  timeframes:
+    - 1d
+    - 4h
+    - 1h
+
+# Sentiment analysis settings
+sentiment:
+  enabled: true
+  engine: llm  # llm | finbert | basic
+  sources:
+    - news
+    - social_media
+  min_articles: 3
+  weight_in_decision: 0.2
+
+# Portfolio settings
+portfolio:
+  initial_capital: 100000.0
+  rebalance_frequency: weekly
+  diversification:
+    min_assets: 3
+    max_single_asset_pct: 20.0
+
+# Agent weights for final decision
+agent_weights:
+  technical: 0.30
+  fundamental: 0.20
+  sentiment: 0.15
+  risk: 0.25
+  market_data: 0.10
+
+# Logging
+logging:
+  console: true
+  file: true
+  file_path: logs/trade.log
+  trade_log_path: logs/trades.log
+  rotation: "10 MB"
+  retention: "30 days"

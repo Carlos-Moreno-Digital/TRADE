@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade"
+version = "0.1.0"
+description = "Autonomous multi-agent trading system with AI-powered analysis"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    # Core Data
+    "yfinance>=0.2.30",
+    "pandas>=2.0",
+    "numpy>=1.24",
+
+    # Technical Analysis
+    "ta-lib>=0.6",
+
+    # AI/ML Agent Framework
+    "dspy>=2.5",
+
+    # Risk & Portfolio
+    "scipy>=1.11",
+
+    # Configuration
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+
+    # ML
+    "scikit-learn>=1.3",
+
+    # Logging & Monitoring
+    "loguru>=0.7",
+    "rich>=13.0",
+
+    # HTTP
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+sentiment = [
+    "transformers>=4.35",
+    "torch>=2.0",
+]
+backtesting = [
+    "vectorbt>=0.26",
+]
+portfolio = [
+    "riskfolio-lib>=6.0",
+]
+openbb = [
+    "openbb>=4.0",
+]
+crypto = [
+    "ccxt>=4.0",
+]
+all = [
+    "trade[sentiment,backtesting,portfolio,openbb,crypto]",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+trade = "trade.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
