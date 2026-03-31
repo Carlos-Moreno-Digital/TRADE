@@ -34,13 +34,13 @@ class ExecutionAgent(BaseAgent):
 
         # Get the portfolio manager's decision (explicitly find it)
         decision = None
-        for sig in reversed(context.signals):
-            if sig.source_agent == "portfolio_manager":
-                decision = sig
-                break
-
-        if decision is None:
-            decision = context.signals[-1] if context.signals else None
+        if context.signals:
+            for sig in reversed(context.signals):
+                if sig.source_agent == "portfolio_manager":
+                    decision = sig
+                    break
+            if decision is None:
+                decision = context.signals[-1]
 
         if decision is None or decision.action == TradeAction.HOLD:
             signal = self._make_signal(
@@ -67,12 +67,15 @@ class ExecutionAgent(BaseAgent):
 
         risk_amount = portfolio.total_value * (risk_per_trade_pct / 100)
 
-        # Use real ATR from technical agent, not volatility
+        # Use real ATR from technical agent - NEVER guess
         atr = context.metadata.get("atr")
         if atr is None or atr <= 0:
-            # Conservative fallback: 1% of price as stop distance
-            atr = latest_price * 0.01
-            self._logger.warning(f"No ATR available, using conservative fallback: {atr:.5f}")
+            self._logger.warning(f"No ATR available for {context.symbol} - REJECTING trade (safety)")
+            signal = self._make_signal(
+                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                reasoning="No ATR data - cannot size position safely",
+            )
+            return self._make_output(signal, {"executed": False, "reason": "no_atr"})
 
         # Stop loss = 1.5x ATR from entry
         sl_multiplier = self.config.get("sl_atr_multiplier", 1.5)

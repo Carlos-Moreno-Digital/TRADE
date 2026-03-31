@@ -88,6 +88,15 @@ class DemoRunner:
         ))
 
         while True:
+            # P2 FIX #12: Check if risk engine killed the account
+            if self.risk_engine and self.risk_engine._is_killed:
+                console.print(f"\n[red bold]{'='*70}[/red bold]")
+                console.print(f"[red bold]ACCOUNT KILLED: {self.risk_engine._kill_reason}[/red bold]")
+                console.print(f"[red bold]Bot stopped automatically. Manual reset required.[/red bold]")
+                console.print(f"[red bold]{'='*70}[/red bold]")
+                self._print_session_summary()
+                break
+
             try:
                 self._run_cycle()
             except KeyboardInterrupt:

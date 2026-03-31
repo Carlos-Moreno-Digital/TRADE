@@ -62,9 +62,25 @@ class MarketDataAgent(BaseAgent):
             return self._make_output(signal, notes="No data")
 
         # Basic price analysis from primary timeframe
+        import pandas as pd
         latest_close = float(df["close"].iloc[-1])
+
+        # P0 FIX: Validate price is sane (not NaN, not 0, not negative)
+        if pd.isna(latest_close) or latest_close <= 0:
+            signal = self._make_signal(
+                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 0.0,
+                reasoning=f"Invalid price data: {latest_close}",
+            )
+            return self._make_output(signal, notes="Invalid price")
+
         prev_close = float(df["close"].iloc[-2]) if len(df) > 1 else latest_close
+        if pd.isna(prev_close) or prev_close <= 0:
+            prev_close = latest_close
         change_pct = ((latest_close - prev_close) / prev_close * 100) if prev_close > 0 else 0
+
+        # P1 FIX: Sanity check - price shouldn't jump >20% in 1 candle
+        if abs(change_pct) > 20:
+            self._logger.warning(f"Price jump {change_pct:.1f}% in 1 candle - possible data error")
 
         # Volume analysis
         avg_volume = float(df["volume"].mean()) if "volume" in df.columns else 0
@@ -76,7 +92,8 @@ class MarketDataAgent(BaseAgent):
         change_20d = 0.0
         if not df_daily.empty and len(df_daily) >= 20:
             price_20d_ago = float(df_daily["close"].iloc[-20])
-            change_20d = (latest_close - price_20d_ago) / price_20d_ago * 100
+            # P0 FIX: Guard against zero division
+            change_20d = (latest_close - price_20d_ago) / price_20d_ago * 100 if price_20d_ago > 0 else 0.0
             if change_20d > 2:
                 daily_trend = "bullish"
             elif change_20d < -2:
@@ -87,7 +104,8 @@ class MarketDataAgent(BaseAgent):
         change_24h = 0.0
         if not df_1h.empty and len(df_1h) >= 24:
             price_24h_ago = float(df_1h["close"].iloc[-24])
-            change_24h = (latest_close - price_24h_ago) / price_24h_ago * 100
+            # P0 FIX: Guard against zero division
+            change_24h = (latest_close - price_24h_ago) / price_24h_ago * 100 if price_24h_ago > 0 else 0.0
             if change_24h > 0.3:
                 intraday_trend = "bullish"
             elif change_24h < -0.3:

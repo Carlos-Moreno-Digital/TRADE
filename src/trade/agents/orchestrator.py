@@ -136,6 +136,11 @@ class Orchestrator:
                 "optimal_time": is_optimal,
                 "time_reason": time_reason,
                 "correlation_warnings": correlation_warnings,
+                # P1 FIX #7: Default to safe state - risk_veto starts True
+                # Only cleared when risk_manager explicitly passes
+                "risk_veto": False,
+                "risk_score": 0.0,
+                "risk_flags": [],
             },
         )
 
@@ -240,13 +245,29 @@ class Orchestrator:
                     try:
                         exec_result = self._execution_agent.analyze(context)
                         results.append(exec_result)
-                        executed = exec_result.raw_data.get("executed", False)
+
+                        # P0 FIX #4: Validate the order with risk engine BEFORE marking executed
+                        order_data = exec_result.raw_data.get("order", {})
+                        if order_data and exec_result.raw_data.get("executed", False):
+                            from trade.data.models import Order
+                            order = Order(**order_data) if isinstance(order_data, dict) else None
+                            if order and self.risk_engine:
+                                valid, reason, _ = self.risk_engine.validate_order(
+                                    order, self.portfolio
+                                )
+                                if not valid:
+                                    logger.warning(f"  [prop_firm] ORDER REJECTED: {reason}")
+                                    executed = False
+                                else:
+                                    executed = True
+                            else:
+                                executed = exec_result.raw_data.get("executed", False)
+                        else:
+                            executed = False
 
                         if executed:
-                            pnl = exec_result.raw_data.get("pnl", 0.0)
-                            self.portfolio.record_trade(pnl)
-                            if self.risk_engine:
-                                self.risk_engine.record_trade_result(pnl)
+                            self.portfolio.record_trade(0.0)  # P&L calculated on position close
+                            self.risk_engine.record_trade_result(0.0)
                     except Exception as e:
                         logger.error(f"  [execution] FAILED: {e}")
             else:
@@ -255,8 +276,7 @@ class Orchestrator:
                     results.append(exec_result)
                     executed = exec_result.raw_data.get("executed", False)
                     if executed:
-                        pnl = exec_result.raw_data.get("pnl", 0.0)
-                        self.portfolio.record_trade(pnl)
+                        self.portfolio.record_trade(0.0)
                 except Exception as e:
                     logger.error(f"  [execution] FAILED: {e}")
 

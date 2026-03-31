@@ -113,12 +113,14 @@ class PortfolioManagerAgent(BaseAgent):
         # Normalize
         final_score = weighted_sum / total_weight if total_weight > 0 else 0.0
 
-        # Apply kill zone bonus / non-optimal penalty
+        # Apply kill zone bonus / non-optimal penalty to CONFIDENCE, not score
+        # P1 FIX #6: Avoid non-linear bias on final_score
         kill_zone = context.metadata.get("kill_zone")
+        confidence_modifier = 1.0
         if kill_zone:
-            final_score *= 1.1  # 10% confidence boost in kill zones
+            confidence_modifier = 1.1  # +10% confidence in kill zones
         elif not context.metadata.get("optimal_time", True):
-            final_score *= 0.7  # 30% penalty outside optimal times
+            confidence_modifier = 0.7  # -30% confidence outside optimal times
 
         # Decision thresholds (HIGHER than before - require stronger consensus)
         min_confidence = self.config.get("min_confidence", 0.35)
@@ -143,7 +145,7 @@ class PortfolioManagerAgent(BaseAgent):
             action = TradeAction.HOLD
             strength = SignalStrength.NEUTRAL
 
-        confidence = min(0.9, abs(final_score))
+        confidence = min(0.9, abs(final_score)) * confidence_modifier
 
         # Reject if confidence too low
         if confidence < min_confidence:
