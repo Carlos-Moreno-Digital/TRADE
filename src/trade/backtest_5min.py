@@ -283,55 +283,63 @@ class ScalpBacktester:
         console.print("\n")
         return self._report(closed, open_pos, max_dd)
 
-    def run_random_samples(self, n_samples: int = 10, symbols: list[str] | None = None) -> dict:
-        """Test strategy on N random 5-day windows from 2 years of 1H data."""
-        import random
+    def run_random_samples(self, n_samples: int = 8, symbols: list[str] | None = None) -> dict:
+        """Test strategy on N non-overlapping 5-day windows from 60 days of REAL 5min data."""
+        import yfinance as yf
+        from datetime import timedelta
 
         if symbols is None:
             symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X",
                        "USDCAD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X"]
 
         console.print(Panel.fit(
-            f"[bold magenta]Random Sample Validation - {n_samples} Random Periods[/bold magenta]\n"
-            f"Downloads 2 years of 1H data, picks {n_samples} random 5-day windows\n"
-            f"Tests scalping strategy on each to validate consistency",
-            title="Monte Carlo Validation",
+            f"[bold magenta]5-Min Validation - {n_samples} Independent Periods[/bold magenta]\n"
+            f"Downloads 60 days of REAL 5min data\n"
+            f"Splits into {n_samples} non-overlapping 5-day windows\n"
+            f"Tests scalping strategy on each independently",
+            title="Scalp Validation",
             border_style="magenta",
         ))
 
-        # Download 1H data (yfinance gives ~730 days at 1H)
-        console.print(f"[dim]Downloading 1H data (2 years) for {len(symbols)} pairs...[/dim]")
-        hourly_data = {}
+        # Download 60 days of 5min data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=59)
+
+        console.print(f"[dim]Downloading 60 days of 5min data for {len(symbols)} pairs...[/dim]")
+        all_5min = {}
         for sym in symbols:
             try:
-                df = self.provider.get_historical(sym, period="2y", interval="1h")
+                df = yf.download(sym, start=start_date, end=end_date,
+                                interval="5m", progress=False)
                 if not df.empty and len(df) >= 500:
-                    hourly_data[sym] = df
+                    if hasattr(df.columns, 'levels'):
+                        df.columns = [c[0].lower() for c in df.columns]
+                    else:
+                        df.columns = [c.lower() for c in df.columns]
+                    all_5min[sym] = df
             except Exception:
                 pass
-        console.print(f"  Got {len(hourly_data)}/{len(symbols)} symbols\n")
+        console.print(f"  Got {len(all_5min)}/{len(symbols)} symbols\n")
 
-        if not hourly_data:
-            console.print("[red]No 1H data available[/red]")
+        if not all_5min:
             return {"error": "No data"}
 
-        # Get all available dates
-        ref = next(iter(hourly_data.values()))
-        all_dates = sorted(set(str(d)[:10] for d in ref.index.tolist()))
+        # Get trading days
+        ref = next(iter(all_5min.values()))
+        all_days = sorted(set(str(d)[:10] for d in ref.index))
+        console.print(f"  {len(all_days)} trading days available\n")
 
-        # Need at least warmup + 5 trading days
-        if len(all_dates) < 60:
-            console.print("[red]Not enough historical dates[/red]")
-            return {"error": "Insufficient data"}
+        # Split into non-overlapping 5-day blocks
+        # Skip first 3 days (warmup for indicators)
+        usable_days = all_days[3:]
+        blocks = []
+        for i in range(0, len(usable_days) - 4, 5):
+            block = usable_days[i:i+5]
+            if len(block) == 5:
+                blocks.append(block)
 
-        # Pick N random start dates (leaving room for 5-day window + warmup)
-        valid_starts = all_dates[50:-10]  # Skip first 50 (warmup) and last 10
-        if len(valid_starts) < n_samples:
-            n_samples = len(valid_starts)
-
-        sample_starts = sorted(random.sample(valid_starts, n_samples))
-
-        console.print(f"Testing {n_samples} random 5-day periods:\n")
+        n_samples = min(n_samples, len(blocks))
+        console.print(f"Testing {n_samples} independent 5-day periods:\n")
 
         results = []
         total_trades = 0
@@ -339,78 +347,50 @@ class ScalpBacktester:
         total_losses = 0
         total_pnl = 0.0
 
-        for idx, start_date in enumerate(sample_starts):
-            # Get 5 trading days of data starting from this date
-            start_idx = all_dates.index(start_date)
-            end_date = all_dates[min(start_idx + 7, len(all_dates) - 1)]  # ~5 trading days
+        for idx, block_days in enumerate(blocks[:n_samples]):
+            block_start = block_days[0]
+            block_end = block_days[-1]
 
-            # Slice data for this window (including warmup before)
-            warmup_date = all_dates[max(start_idx - 50, 0)]
-
-            window_data = {}
-            for sym, df in hourly_data.items():
-                # Handle timezone-aware vs naive index
-                try:
-                    if df.index.tz is not None:
-                        start_ts = pd.Timestamp(warmup_date).tz_localize(df.index.tz)
-                        end_ts = pd.Timestamp(end_date + " 23:59").tz_localize(df.index.tz)
-                    else:
-                        start_ts = pd.Timestamp(warmup_date)
-                        end_ts = pd.Timestamp(end_date + " 23:59")
-                    mask = (df.index >= start_ts) & (df.index <= end_ts)
-                    sliced = df[mask]
-                except Exception:
-                    # Fallback: use string comparison on index
-                    sliced = df[df.index.astype(str).str[:10] >= warmup_date]
-                    sliced = sliced[sliced.index.astype(str).str[:10] <= end_date]
-                if len(sliced) >= 50:
-                    window_data[sym] = sliced
-
-            if not window_data:
-                continue
-
-            # Run the scalp strategy on this window
-            # Reset state
+            # Run strategy on this block
             cash = self.account_size
-            equity = self.account_size
-            peak = self.account_size
             open_pos = []
             closed = []
             max_dd = 0.0
+            peak = self.account_size
             trades_today = 0
             current_day = ""
 
-            ref_w = next(iter(window_data.values()))
-            timestamps = sorted(ref_w.index.tolist())
-            warmup_candles = 50
+            ref_df = next(iter(all_5min.values()))
+            all_ts = sorted(ref_df.index.tolist())
+            warmup = 50
 
-            for i in range(warmup_candles, len(timestamps)):
-                ts = timestamps[i]
+            for i in range(warmup, len(all_ts)):
+                ts = all_ts[i]
                 ts_str = str(ts)
                 day = ts_str[:10]
-                hour = ts.hour if hasattr(ts, 'hour') else 12
 
-                if day < start_date:
-                    continue  # Still in warmup
+                if day < block_start or day > block_end:
+                    continue
+
+                hour = ts.hour if hasattr(ts, 'hour') else 12
+                if not (7 <= hour <= 16):
+                    continue
 
                 if day != current_day:
                     trades_today = 0
                     current_day = day
 
-                if not (7 <= hour <= 16):
-                    continue
-
                 # Check SL/TP
                 to_close = []
                 for pos in open_pos:
-                    df = window_data.get(pos.symbol)
+                    df = all_5min.get(pos.symbol)
                     if df is None:
                         continue
                     mask = df.index <= ts
                     if mask.sum() == 0:
                         continue
                     c = df[mask].iloc[-1]
-                    h, l, cp = float(c["high"]), float(c["low"]), float(c["close"])
+                    h, l = float(c["high"]), float(c["low"])
                     spread = SCALP_SPREADS.get(pos.symbol, 0.0002)
                     slip = spread * SLIPPAGE
 
@@ -418,34 +398,29 @@ class ScalpBacktester:
                         if l <= pos.stop_loss:
                             pos.exit_price = pos.stop_loss - slip
                             pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
-                            pos.exit_reason = "SL"
-                            to_close.append(pos)
+                            pos.exit_reason = "SL"; to_close.append(pos)
                         elif h >= pos.take_profit:
                             pos.exit_price = pos.take_profit - slip
                             pos.pnl = (pos.exit_price - pos.entry_price) * pos.quantity
-                            pos.exit_reason = "TP"
-                            to_close.append(pos)
+                            pos.exit_reason = "TP"; to_close.append(pos)
                     else:
                         if h >= pos.stop_loss:
                             pos.exit_price = pos.stop_loss + slip
                             pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
-                            pos.exit_reason = "SL"
-                            to_close.append(pos)
+                            pos.exit_reason = "SL"; to_close.append(pos)
                         elif l <= pos.take_profit:
                             pos.exit_price = pos.take_profit + slip
                             pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
-                            pos.exit_reason = "TP"
-                            to_close.append(pos)
+                            pos.exit_reason = "TP"; to_close.append(pos)
 
                 for pos in to_close:
-                    margin = pos.entry_price * pos.quantity * 0.01
-                    cash += margin + pos.pnl
+                    cash += pos.entry_price * pos.quantity * 0.01 + pos.pnl
                     open_pos.remove(pos)
                     closed.append(pos)
 
                 # New entries
                 if len(open_pos) < self.max_trades and trades_today < self.max_trades_per_day:
-                    for sym, df in window_data.items():
+                    for sym, df in all_5min.items():
                         if len(open_pos) >= self.max_trades:
                             break
                         if any(p.symbol == sym for p in open_pos):
@@ -459,13 +434,11 @@ class ScalpBacktester:
                             continue
 
                         entry = signal["price"]
-                        risk_dist = abs(entry - signal["sl"])
-                        if risk_dist <= 0:
+                        rd = abs(entry - signal["sl"])
+                        if rd <= 0:
                             continue
-                        risk_amt = self.account_size * self.risk_per_trade
-                        qty = risk_amt / risk_dist
-                        max_qty = self.account_size * 5 / entry if entry > 0 else 0
-                        qty = min(qty, max_qty)
+                        qty = min(self.account_size * self.risk_per_trade / rd,
+                                  self.account_size * 5 / entry if entry > 0 else 0)
 
                         spread = SCALP_SPREADS.get(sym, 0.0002)
                         slip = spread * SLIPPAGE
@@ -473,32 +446,30 @@ class ScalpBacktester:
 
                         pos = ScalpPosition(sym, signal["action"], fill, round(qty, 4),
                                             signal["sl"], signal["tp"], ts_str)
-                        margin = fill * qty * 0.01
-                        cash -= margin
+                        cash -= fill * qty * 0.01
                         open_pos.append(pos)
                         trades_today += 1
 
                 # Equity
-                unrealized = sum(
-                    ((float(window_data[p.symbol][window_data[p.symbol].index <= ts].iloc[-1]["close"]) - p.entry_price) * p.quantity
-                     if p.side == "buy" else
-                     (p.entry_price - float(window_data[p.symbol][window_data[p.symbol].index <= ts].iloc[-1]["close"])) * p.quantity)
-                    for p in open_pos if p.symbol in window_data and window_data[p.symbol].index[window_data[p.symbol].index <= ts].shape[0] > 0
-                ) if open_pos else 0
-
                 margin_held = sum(p.entry_price * p.quantity * 0.01 for p in open_pos)
+                unrealized = 0
+                for p in open_pos:
+                    df = all_5min.get(p.symbol)
+                    if df is None: continue
+                    m = df.index <= ts
+                    if m.sum() == 0: continue
+                    cp = float(df[m].iloc[-1]["close"])
+                    unrealized += (cp - p.entry_price) * p.quantity if p.side == "buy" else (p.entry_price - cp) * p.quantity
+
                 equity = cash + margin_held + unrealized
-                if equity > peak:
-                    peak = equity
-                dd = (peak - equity) / peak * 100 if peak > 0 else 0
-                max_dd = max(max_dd, min(dd, 100))
+                if equity > peak: peak = equity
+                dd = min((peak - equity) / peak * 100 if peak > 0 else 0, 100)
+                max_dd = max(max_dd, dd)
 
             # Close remaining
             for pos in open_pos:
-                margin = pos.entry_price * pos.quantity * 0.01
-                cash += margin
+                cash += pos.entry_price * pos.quantity * 0.01
 
-            # Calculate result for this window
             w = sum(1 for t in closed if t.pnl > 0)
             l_count = sum(1 for t in closed if t.pnl <= 0)
             pnl = sum(t.pnl for t in closed)
@@ -512,28 +483,21 @@ class ScalpBacktester:
             pc = "green" if pnl >= 0 else "red"
             wr = w / len(closed) * 100 if closed else 0
             console.print(
-                f"  [{idx+1:2d}/{n_samples}] {start_date} → {end_date} | "
+                f"  [{idx+1:2d}/{n_samples}] {block_start} → {block_end} | "
                 f"{len(closed):3d} trades | W:{w} L:{l_count} ({wr:.0f}%) | "
                 f"[{pc}]${pnl:+.2f} ({pnl_pct:+.1f}%)[/{pc}] | DD:{max_dd:.1f}%"
             )
-
-            results.append({
-                "start": start_date, "end": end_date,
-                "trades": len(closed), "wins": w, "losses": l_count,
-                "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2),
-                "win_rate": round(wr, 1), "max_dd": round(min(max_dd, 100), 2),
-            })
+            results.append({"start": block_start, "end": block_end, "trades": len(closed),
+                           "wins": w, "losses": l_count, "pnl": round(pnl, 2),
+                           "pnl_pct": round(pnl_pct, 2), "win_rate": round(wr, 1), "max_dd": round(max_dd, 2)})
 
         # Summary
         console.print(f"\n{'='*70}")
         profitable = sum(1 for r in results if r["pnl"] > 0)
-        avg_pnl = total_pnl / n_samples if n_samples > 0 else 0
+        avg_pnl = total_pnl / max(1, n_samples)
         overall_wr = total_wins / max(1, total_wins + total_losses) * 100
 
-        console.print(Panel.fit(
-            f"[bold]Monte Carlo Summary - {n_samples} Random Periods[/bold]",
-            border_style="magenta",
-        ))
+        console.print(Panel.fit(f"[bold]Validation Summary - {n_samples} Periods[/bold]", border_style="magenta"))
 
         st = Table(show_header=False, box=None)
         st.add_column("", style="bold", width=28)
@@ -542,23 +506,19 @@ class ScalpBacktester:
         st.add_row("Total Trades", str(total_trades))
         st.add_row("Overall Win Rate", f"{overall_wr:.1f}%")
         pc = "green" if total_pnl >= 0 else "red"
-        st.add_row("Total P&L (all periods)", f"[{pc}]${total_pnl:+,.2f}[/{pc}]")
+        st.add_row("Total P&L", f"[{pc}]${total_pnl:+,.2f}[/{pc}]")
         st.add_row("Avg P&L per 5-day period", f"[{pc}]${avg_pnl:+,.2f} ({avg_pnl/self.account_size*100:+.2f}%)[/{pc}]")
-        monthly_proj = avg_pnl * (22 / 5)
-        mp = "green" if monthly_proj >= 0 else "red"
-        st.add_row("Projected Monthly P&L", f"[{mp}]${monthly_proj:+,.0f} ({monthly_proj/self.account_size*100:+.1f}%)[/{mp}]")
+        mp = avg_pnl * (22 / 5)
+        mc = "green" if mp >= 0 else "red"
+        st.add_row("Projected Monthly P&L", f"[{mc}]${mp:+,.0f} ({mp/self.account_size*100:+.1f}%)[/{mc}]")
         st.add_row("", "")
-        pace_ok = monthly_proj / self.account_size * 100 >= 10
-        st.add_row("10% Challenge Pace?", f"[{'green bold' if pace_ok else 'red'}]{'YES' if pace_ok else 'NO'}[/{'green bold' if pace_ok else 'red'}]")
+        pace = mp / self.account_size * 100 >= 10
+        st.add_row("10% Challenge Pace?", f"[{'green bold' if pace else 'red'}]{'YES' if pace else 'NO'}[/{'green bold' if pace else 'red'}]")
         console.print(st)
 
-        return {
-            "samples": n_samples, "profitable": profitable,
-            "total_trades": total_trades, "win_rate": round(overall_wr, 1),
-            "total_pnl": round(total_pnl, 2), "avg_pnl": round(avg_pnl, 2),
-            "monthly_projected": round(monthly_proj, 2),
-            "results": results,
-        }
+        return {"samples": n_samples, "profitable": profitable, "total_trades": total_trades,
+                "win_rate": round(overall_wr, 1), "total_pnl": round(total_pnl, 2),
+                "avg_pnl": round(avg_pnl, 2), "monthly_projected": round(mp, 2), "results": results}
 
     def _scalp_signal(self, df: pd.DataFrame, symbol: str) -> dict | None:
         """5-minute scalping: momentum + mean reversion hybrid."""
