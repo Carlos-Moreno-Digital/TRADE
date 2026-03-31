@@ -163,6 +163,20 @@ class Backtester:
                         pos.pnl = (pos.entry_price - pos.exit_price) * pos.quantity
                         positions_to_close.append(pos)
 
+                # TIME-BASED EXIT: close after 7 trading days if not at TP
+                if pos not in positions_to_close:
+                    days_held = sum(1 for d in sim_dates[:i+1]
+                                   if str(d)[:10] >= pos.entry_date)
+                    if days_held >= 7:
+                        if pos.side == "long":
+                            pos.exit_price = close_price
+                            pos.pnl = (close_price - pos.entry_price) * pos.quantity
+                        else:
+                            pos.exit_price = close_price
+                            pos.pnl = (pos.entry_price - close_price) * pos.quantity
+                        pos.exit_reason = "TIME"
+                        positions_to_close.append(pos)
+
             for pos in positions_to_close:
                 pos.exit_date = date_str
                 cash += pos.pnl + (pos.entry_price * pos.quantity if pos.side == "long" else 0)
@@ -308,6 +322,7 @@ class Backtester:
             ema21 = talib.EMA(close, timeperiod=21)
             ema50 = talib.EMA(close, timeperiod=50)
             atr = talib.ATR(high, low, close, timeperiod=14)
+            adx = talib.ADX(high, low, close, timeperiod=14)
             stoch_k, stoch_d = talib.STOCH(high, low, close)
             upper, middle, lower = talib.BBANDS(close, timeperiod=20)
 
@@ -322,7 +337,14 @@ class Backtester:
             bb_upper = float(upper[-1]) if not math.isnan(upper[-1]) else latest * 1.02
             bb_lower = float(lower[-1]) if not math.isnan(lower[-1]) else latest * 0.98
 
+            adx_val = float(adx[-1]) if not math.isnan(adx[-1]) else 20
+
             if atr_val <= 0:
+                return None
+
+            # ADX filter: only trade when trend is strong (ADX > 20)
+            # ADX < 20 = ranging market = avoid
+            if adx_val < 18:
                 return None
 
             # === MAJOR TREND FILTER (THE KEY RULE) ===
