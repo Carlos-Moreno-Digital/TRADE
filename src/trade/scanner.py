@@ -390,16 +390,32 @@ class MarketScanner:
         # Filter: must have some directional bias (not flat)
         candidates = [r for r in scan_results if abs(r.score) > 0.1 and r.is_open]
 
-        # DIVERSITY: Don't pick multiple instruments from same asset class
-        # Pick max 1 per class, spread across forex/commodity/index/crypto
-        seen_classes = set()
-        diverse_top = []
-        for c in candidates:
-            if c.asset_class not in seen_classes or len(diverse_top) < 2:
-                diverse_top.append(c)
-                seen_classes.add(c.asset_class)
-                if len(diverse_top) >= self.top_n:
+        # DIVERSITY: Strict 1-per-class, prioritize forex for prop firm
+        # Priority order: forex > commodity > index > crypto > etf > stock
+        class_priority = ["forex", "commodity", "index", "crypto", "etf", "stock_us", "stock_eu"]
+        seen_classes: set[str] = set()
+        seen_symbols: set[str] = set()
+        diverse_top: list[ScanResult] = []
+
+        # First pass: pick best from each class in priority order
+        for target_class in class_priority:
+            for c in candidates:
+                if c.asset_class == target_class and c.asset_class not in seen_classes and c.symbol not in seen_symbols:
+                    diverse_top.append(c)
+                    seen_classes.add(c.asset_class)
+                    seen_symbols.add(c.symbol)
                     break
+            if len(diverse_top) >= self.top_n:
+                break
+
+        # Second pass: fill remaining slots with strongest signals from any class
+        if len(diverse_top) < self.top_n:
+            for c in candidates:
+                if c.symbol not in seen_symbols:
+                    diverse_top.append(c)
+                    seen_symbols.add(c.symbol)
+                    if len(diverse_top) >= self.top_n:
+                        break
 
         top = diverse_top if diverse_top else candidates[:self.top_n]
 

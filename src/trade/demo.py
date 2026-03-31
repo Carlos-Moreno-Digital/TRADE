@@ -69,7 +69,10 @@ class DemoRunner:
             cache=self.cache,
         )
 
-        self.scanner = MarketScanner(top_n=top_n)
+        # Scanner with cached data provider (avoids hammering API)
+        from trade.data.providers import MarketDataProvider
+        cached_provider = MarketDataProvider(cache=self.cache)
+        self.scanner = MarketScanner(provider=cached_provider, top_n=top_n)
 
         self._cycle_count = 0
         self._total_signals = {"buy": 0, "sell": 0, "hold": 0}
@@ -184,6 +187,9 @@ class DemoRunner:
             # Track signal counts
             decision = result["final_decision"]
             self._total_signals[decision] = self._total_signals.get(decision, 0) + 1
+
+        # Update open position prices from scan data
+        self._update_position_prices(scan_results)
 
         # Print results table
         self._print_cycle_results(results)
@@ -357,6 +363,36 @@ class DemoRunner:
             time.sleep(min(10, remaining))
             remaining -= 10
         console.print()
+
+    def _update_position_prices(self, scan_results: list | None = None) -> None:
+        """Update open position prices from scan data so P&L is accurate."""
+        portfolio = self.orchestrator.portfolio
+        if not portfolio.positions:
+            return
+
+        # Build price map from scan results
+        prices = {}
+        if scan_results:
+            for r in scan_results:
+                # scan_results have momentum but not price - use provider
+                pass
+
+        # Fetch latest prices for open positions directly
+        from trade.data.providers import MarketDataProvider
+        provider = MarketDataProvider()
+        for pos in portfolio.positions:
+            try:
+                df = provider.get_historical(pos.symbol, period="5d", interval="1d")
+                if not df.empty:
+                    latest_price = float(df["close"].iloc[-1])
+                    pos.update_price(latest_price)
+            except Exception:
+                pass
+
+        # Recalculate portfolio value
+        position_value = sum(p.quantity * p.current_price for p in portfolio.positions)
+        portfolio.total_value = portfolio.cash + position_value
+        portfolio.update_drawdown()
 
     def _print_session_summary(self) -> None:
         """Print end-of-session summary."""
