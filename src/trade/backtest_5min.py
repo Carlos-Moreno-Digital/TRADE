@@ -79,19 +79,23 @@ class ScalpBacktester:
         # Download 5min data (yfinance: max 5 days)
         console.print(f"[dim]Downloading 5min data for {len(symbols)} pairs...[/dim]")
         all_data = {}
+        import yfinance as yf
+        from datetime import timedelta
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
+
         for sym in symbols:
             try:
-                # Try 5min first (5 days), fallback to 15min (1 month)
-                df = self.provider.get_historical(sym, period="5d", interval="5m")
-                if df.empty or len(df) < 100:
-                    # 15min gives ~1 month of data - still intraday
-                    df = self.provider.get_historical(sym, period="1mo", interval="15m")
-                if not df.empty and len(df) >= 100:
+                # Download 30 days of 5min data using start/end (not period)
+                df = yf.download(sym, start=start_date, end=end_date,
+                                interval="5m", progress=False)
+                if not df.empty and len(df) >= 200:
+                    # Normalize columns
+                    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
                     all_data[sym] = df
             except Exception:
                 pass
-        interval = "5min" if all_data and len(next(iter(all_data.values()))) < 2000 else "15min"
-        console.print(f"  Got {len(all_data)}/{len(symbols)} symbols ({interval} data)\n")
+        console.print(f"  Got {len(all_data)}/{len(symbols)} symbols (5min, 30 days)\n")
 
         if not all_data:
             return {"error": "No data"}
