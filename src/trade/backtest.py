@@ -83,7 +83,7 @@ class Backtester:
         from trade.risk.prop_firm import load_prop_firm_config
         prop_config = load_prop_firm_config(prop_firm)
         self.account_size = prop_config.account_size
-        self.base_risk = 0.01        # 1% base risk per trade
+        self.base_risk = 0.01        # 1% risk per trade
         self.max_trades = 3          # Max 3 concurrent (less = more focused)
         self.min_rr = 1.5
         self.top_n = top_n
@@ -593,11 +593,11 @@ class Backtester:
                     action = "sell"
                     confidence = min(0.95, bear_score * 0.1)
             elif regime == "RANGING":
-                # Mean reversion needs extreme signals
-                if net_score >= 4 and bull_score >= 5:
+                # Mean reversion needs VERY extreme signals (raised from 4/5)
+                if net_score >= 5 and bull_score >= 6:
                     action = "buy"
                     confidence = min(0.85, bull_score * 0.1)
-                elif net_score <= -4 and bear_score >= 5:
+                elif net_score <= -5 and bear_score >= 6:
                     action = "sell"
                     confidence = min(0.85, bear_score * 0.1)
 
@@ -606,11 +606,11 @@ class Backtester:
 
             # SL/TP based on regime
             if regime == "TRENDING":
-                sl_mult = 1.2
-                tp_mult = 2.5  # Wider TP in trends (let it run)
+                sl_mult = 1.0
+                tp_mult = 1.8  # Achievable TP with trailing stop to extend
             else:
-                sl_mult = 1.0  # Tighter in ranges
-                tp_mult = 1.8  # Shorter TP in ranges (mean reversion)
+                sl_mult = 0.8  # Tight in ranges
+                tp_mult = 1.3  # Quick mean reversion target
 
             if action == "buy":
                 sl = latest - atr_val * sl_mult
