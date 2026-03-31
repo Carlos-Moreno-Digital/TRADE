@@ -1,4 +1,4 @@
-"""Execution Agent - Handles order creation and execution (paper/live)."""
+"""Execution Agent - Handles order creation with proper risk controls."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from trade.data.models import (
 
 
 class ExecutionAgent(BaseAgent):
-    """Executes trades based on portfolio manager decisions. Paper trading by default."""
+    """Executes trades with proper position sizing using ATR and SL/TP validation."""
 
     name = "execution"
 
@@ -32,8 +32,16 @@ class ExecutionAgent(BaseAgent):
         """Execute or simulate the trade decision."""
         start = time.time()
 
-        # Get the portfolio manager's decision (last signal)
-        decision = context.signals[-1] if context.signals else None
+        # Get the portfolio manager's decision (explicitly find it)
+        decision = None
+        for sig in reversed(context.signals):
+            if sig.source_agent == "portfolio_manager":
+                decision = sig
+                break
+
+        if decision is None:
+            decision = context.signals[-1] if context.signals else None
+
         if decision is None or decision.action == TradeAction.HOLD:
             signal = self._make_signal(
                 context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
@@ -41,7 +49,7 @@ class ExecutionAgent(BaseAgent):
             )
             return self._make_output(signal, {"executed": False})
 
-        # Calculate position size
+        # Get price data
         latest_price = context.metadata.get("latest_close", 0)
         if latest_price <= 0:
             signal = self._make_signal(
@@ -50,45 +58,117 @@ class ExecutionAgent(BaseAgent):
             )
             return self._make_output(signal, {"executed": False, "reason": "no_price"})
 
-        # Position sizing: risk-based
+        # =====================================================================
+        # POSITION SIZING using real ATR (not volatility hack)
+        # =====================================================================
         portfolio = context.portfolio
-        risk_per_trade_pct = self.config.get("risk_per_trade_pct", 1.0)
+        risk_per_trade_pct = self.config.get("risk_per_trade_pct", 0.5)
         max_position_pct = self.config.get("max_position_pct", 5.0)
 
-        # Calculate quantity based on risk
         risk_amount = portfolio.total_value * (risk_per_trade_pct / 100)
-        volatility = context.metadata.get("volatility", 2.0)
-        atr_estimate = latest_price * (volatility / 100)
 
-        if atr_estimate > 0:
-            quantity = risk_amount / atr_estimate
-        else:
-            quantity = risk_amount / (latest_price * 0.02)  # Default 2% stop
+        # Use real ATR from technical agent, not volatility
+        atr = context.metadata.get("atr")
+        if atr is None or atr <= 0:
+            # Conservative fallback: 1% of price as stop distance
+            atr = latest_price * 0.01
+            self._logger.warning(f"No ATR available, using conservative fallback: {atr:.5f}")
 
-        # Cap at max position size
-        max_value = portfolio.total_value * (max_position_pct / 100)
-        max_quantity = max_value / latest_price
-        quantity = min(quantity, max_quantity)
+        # Stop loss = 1.5x ATR from entry
+        sl_multiplier = self.config.get("sl_atr_multiplier", 1.5)
+        # Take profit = target R:R * SL distance
+        target_rr = self.config.get("target_rr", 2.0)
+        min_rr = self.config.get("min_rr", 1.5)
 
-        # For crypto, allow fractional. For stocks, round to whole shares
-        if context.asset_type.value != "crypto":
-            quantity = max(1, int(quantity))
+        stop_distance = atr * sl_multiplier
+        tp_distance = stop_distance * target_rr
 
-        # Calculate stop loss and take profit
-        stop_distance = atr_estimate * 1.5
-        take_profit_distance = atr_estimate * 3.0
-
+        # Calculate SL/TP based on direction
         if decision.action == TradeAction.BUY:
             stop_loss = latest_price - stop_distance
-            take_profit = latest_price + take_profit_distance
-        elif decision.action == TradeAction.SELL:
+            take_profit = latest_price + tp_distance
+        elif decision.action in (TradeAction.SELL, TradeAction.SHORT):
             stop_loss = latest_price + stop_distance
-            take_profit = latest_price - take_profit_distance
+            take_profit = latest_price - tp_distance
         else:
             stop_loss = None
             take_profit = None
 
-        # Create order
+        # =====================================================================
+        # SL/TP SANITY VALIDATION
+        # =====================================================================
+        if stop_loss is not None and take_profit is not None:
+            if decision.action == TradeAction.BUY:
+                if not (stop_loss < latest_price < take_profit):
+                    self._logger.error(
+                        f"SL/TP sanity FAIL for BUY: SL={stop_loss:.5f} "
+                        f"Entry={latest_price:.5f} TP={take_profit:.5f}"
+                    )
+                    signal = self._make_signal(
+                        context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                        reasoning="SL/TP sanity check failed for BUY",
+                    )
+                    return self._make_output(signal, {"executed": False, "reason": "sl_tp_invalid"})
+
+            elif decision.action in (TradeAction.SELL, TradeAction.SHORT):
+                if not (take_profit < latest_price < stop_loss):
+                    self._logger.error(
+                        f"SL/TP sanity FAIL for SELL: TP={take_profit:.5f} "
+                        f"Entry={latest_price:.5f} SL={stop_loss:.5f}"
+                    )
+                    signal = self._make_signal(
+                        context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                        reasoning="SL/TP sanity check failed for SELL",
+                    )
+                    return self._make_output(signal, {"executed": False, "reason": "sl_tp_invalid"})
+
+            # Validate R:R ratio
+            risk = abs(latest_price - stop_loss)
+            reward = abs(take_profit - latest_price)
+            actual_rr = reward / risk if risk > 0 else 0
+
+            if actual_rr < min_rr:
+                self._logger.warning(
+                    f"R:R ratio {actual_rr:.2f} < minimum {min_rr}. Rejecting trade."
+                )
+                signal = self._make_signal(
+                    context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                    reasoning=f"R:R ratio {actual_rr:.2f} below minimum {min_rr}",
+                )
+                return self._make_output(signal, {"executed": False, "reason": "rr_too_low"})
+
+        # =====================================================================
+        # QUANTITY CALCULATION
+        # =====================================================================
+        if stop_distance > 0:
+            quantity = risk_amount / stop_distance
+        else:
+            quantity = 0
+
+        # Cap at max position size
+        max_value = portfolio.total_value * (max_position_pct / 100)
+        max_quantity = max_value / latest_price if latest_price > 0 else 0
+        quantity = min(quantity, max_quantity)
+
+        # Cap at max lots
+        max_lots = self.config.get("max_lots", 5.0)
+        quantity = min(quantity, max_lots)
+
+        # Minimum quantity check
+        if quantity < 0.01:
+            signal = self._make_signal(
+                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                reasoning=f"Quantity too small: {quantity:.4f}",
+            )
+            return self._make_output(signal, {"executed": False, "reason": "qty_too_small"})
+
+        # For non-crypto, round appropriately
+        if context.asset_type.value != "crypto":
+            quantity = round(quantity, 2)
+
+        # =====================================================================
+        # CREATE ORDER
+        # =====================================================================
         order = Order(
             id=str(uuid.uuid4())[:8],
             symbol=context.symbol,
@@ -96,15 +176,15 @@ class ExecutionAgent(BaseAgent):
             action=decision.action,
             quantity=quantity,
             price=latest_price,
-            stop_loss=round(stop_loss, 2) if stop_loss else None,
-            take_profit=round(take_profit, 2) if take_profit else None,
+            stop_loss=round(stop_loss, 5) if stop_loss else None,
+            take_profit=round(take_profit, 5) if take_profit else None,
         )
 
         # Execute based on mode
         if self.mode == "paper":
             executed = self._paper_execute(order, context)
         else:
-            self._logger.error("Live trading not yet implemented!")
+            self._logger.error("Live trading must go through TradeLockerBroker!")
             executed = False
 
         raw_data = {
@@ -113,15 +193,19 @@ class ExecutionAgent(BaseAgent):
             "order": order.model_dump(),
             "position_value": round(quantity * latest_price, 2),
             "risk_amount": round(risk_amount, 2),
+            "atr": round(atr, 5),
+            "stop_distance": round(stop_distance, 5),
+            "rr_ratio": round(actual_rr, 2) if stop_loss and take_profit else 0,
         }
 
         action = decision.action if executed else TradeAction.HOLD
         signal = self._make_signal(
             context, action, decision.strength, decision.confidence,
             reasoning=f"{'EXECUTED' if executed else 'NOT EXECUTED'} [{self.mode}] "
-                     f"{decision.action.value} {quantity:.2f} {context.symbol} @ {latest_price:.2f} | "
-                     f"SL: {stop_loss:.2f if stop_loss else 'N/A'} | "
-                     f"TP: {take_profit:.2f if take_profit else 'N/A'}",
+                     f"{decision.action.value} {quantity:.2f} {context.symbol} @ {latest_price:.5f} | "
+                     f"SL: {stop_loss:.5f if stop_loss else 'N/A'} | "
+                     f"TP: {take_profit:.5f if take_profit else 'N/A'} | "
+                     f"R:R: {actual_rr:.2f if stop_loss and take_profit else 'N/A'}",
         )
 
         exec_time = (time.time() - start) * 1000
@@ -131,14 +215,13 @@ class ExecutionAgent(BaseAgent):
         """Simulate order execution in paper trading mode."""
         self._logger.info(
             f"[PAPER] Executing: {order.action.value} {order.quantity:.2f} "
-            f"{order.symbol} @ {order.price:.2f}"
+            f"{order.symbol} @ {order.price:.5f}"
         )
 
         order.status = "filled"
         order.fill_price = order.price
         self._paper_orders.append(order)
 
-        # Update portfolio
         portfolio = context.portfolio
         cost = order.quantity * order.price
 
@@ -157,8 +240,10 @@ class ExecutionAgent(BaseAgent):
                         take_profit=order.take_profit,
                     )
                 )
-                portfolio.trades_today += 1
-                self._logger.info(f"[PAPER] Opened LONG {order.symbol}: {order.quantity:.2f} @ {order.price:.2f}")
+                self._logger.info(
+                    f"[PAPER] Opened LONG {order.symbol}: {order.quantity:.2f} "
+                    f"@ {order.price:.5f} | SL: {order.stop_loss} | TP: {order.take_profit}"
+                )
                 return True
             else:
                 self._logger.warning(f"[PAPER] Insufficient cash: {portfolio.cash:.2f} < {cost:.2f}")
@@ -166,22 +251,12 @@ class ExecutionAgent(BaseAgent):
                 return False
 
         elif order.action in (TradeAction.SELL, TradeAction.SHORT):
-            # Close existing long position or open short
             for i, pos in enumerate(portfolio.positions):
                 if pos.symbol == order.symbol and pos.side == "long":
                     pnl = (order.price - pos.entry_price) * pos.quantity
                     portfolio.cash += pos.quantity * order.price
                     portfolio.positions.pop(i)
-                    portfolio.trades_today += 1
-
-                    if pnl < 0:
-                        portfolio.consecutive_losses += 1
-                    else:
-                        portfolio.consecutive_losses = 0
-
-                    self._logger.info(
-                        f"[PAPER] Closed LONG {order.symbol}: P&L = {pnl:.2f}"
-                    )
+                    self._logger.info(f"[PAPER] Closed LONG {order.symbol}: P&L = {pnl:.2f}")
                     return True
 
             self._logger.info(f"[PAPER] No position to close for {order.symbol}")

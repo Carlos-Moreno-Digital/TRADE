@@ -147,6 +147,9 @@ class PortfolioState(BaseModel):
     consecutive_losses: int = 0
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
+    _initial_value: float = 0.0
+    _day_start_value: float = 0.0
+
     def update_drawdown(self) -> None:
         """Update peak value and max drawdown."""
         if self.total_value > self.peak_value:
@@ -154,6 +157,50 @@ class PortfolioState(BaseModel):
         if self.peak_value > 0:
             current_dd = (self.peak_value - self.total_value) / self.peak_value * 100
             self.max_drawdown_pct = max(self.max_drawdown_pct, current_dd)
+
+    def record_trade(self, pnl: float) -> None:
+        """Record a completed trade's P&L and update all tracking metrics."""
+        self.daily_pnl += pnl
+        self.total_pnl += pnl
+        self.trades_today += 1
+
+        if pnl < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+        # Recalculate total value
+        position_value = sum(
+            pos.quantity * pos.current_price for pos in self.positions
+        )
+        self.total_value = self.cash + position_value
+
+        if self._initial_value > 0:
+            self.total_pnl_pct = (self.total_value - self._initial_value) / self._initial_value * 100
+
+        self.update_drawdown()
+
+    def reset_daily(self) -> None:
+        """Reset daily counters for a new trading day."""
+        self._day_start_value = self.total_value
+        self.daily_pnl = 0.0
+        self.trades_today = 0
+
+    def initialize(self, capital: float) -> None:
+        """Set initial capital for tracking."""
+        self._initial_value = capital
+        self._day_start_value = capital
+        self.cash = capital
+        self.total_value = capital
+        self.peak_value = capital
+
+    @property
+    def daily_loss_pct(self) -> float:
+        """Current daily loss as percentage."""
+        if self._day_start_value <= 0:
+            return 0.0
+        loss = self._day_start_value - self.total_value
+        return max(0.0, loss / self._day_start_value * 100)
 
 
 class AnalysisContext(BaseModel):

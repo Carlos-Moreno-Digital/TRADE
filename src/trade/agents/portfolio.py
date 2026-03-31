@@ -42,17 +42,36 @@ class PortfolioManagerAgent(BaseAgent):
         start = time.time()
         self._logger.info(f"Portfolio manager deciding for {context.symbol}")
 
-        # Check for risk veto first
+        # =====================================================================
+        # ABSOLUTE RISK VETO - Cannot be overridden by any agent combination
+        # This is the #1 most important safety mechanism
+        # =====================================================================
         if context.metadata.get("risk_veto", False):
-            self._logger.warning(f"Risk veto active for {context.symbol} - forcing HOLD")
-            signal = self._make_signal(
-                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 0.95,
-                reasoning="Risk manager VETO - trade blocked",
+            risk_flags = context.metadata.get("risk_flags", [])
+            self._logger.warning(
+                f"ABSOLUTE RISK VETO for {context.symbol} - "
+                f"trade BLOCKED. Flags: {risk_flags}"
             )
-            return self._make_output(signal, {"decision": "veto"}, exec_time=0)
+            signal = self._make_signal(
+                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 1.0,
+                reasoning=f"ABSOLUTE RISK VETO - {'; '.join(risk_flags) if risk_flags else 'risk limits breached'}",
+            )
+            return self._make_output(signal, {"decision": "veto", "risk_flags": risk_flags}, exec_time=0)
 
-        # Collect signals from prior agents
-        agent_signals = context.signals
+        # Check risk score even if not full veto - high risk = reduce confidence
+        risk_score = context.metadata.get("risk_score", 0.0)
+        if risk_score >= 0.5:
+            self._logger.warning(
+                f"High risk score ({risk_score:.2f}) for {context.symbol} - forcing HOLD"
+            )
+            signal = self._make_signal(
+                context, TradeAction.HOLD, SignalStrength.NEUTRAL, 0.8,
+                reasoning=f"Risk score {risk_score:.2f} too high for trading",
+            )
+            return self._make_output(signal, {"decision": "high_risk"}, exec_time=0)
+
+        # Collect signals from prior agents (EXCLUDE risk_manager - it vetoes, not votes)
+        agent_signals = [s for s in context.signals if s.source_agent != "risk_manager"]
         if not agent_signals:
             signal = self._make_signal(
                 context, TradeAction.HOLD, SignalStrength.NEUTRAL, 0.1,
@@ -60,13 +79,12 @@ class PortfolioManagerAgent(BaseAgent):
             )
             return self._make_output(signal, notes="No signals")
 
-        # Weight mapping for agent names
+        # Weight mapping for agent names (risk_manager excluded from voting)
         weight_map = {
             "market_data": self.weights.market_data,
             "technical": self.weights.technical,
             "sentiment": self.weights.sentiment,
             "fundamental": self.weights.fundamental,
-            "risk_manager": self.weights.risk,
         }
 
         # Calculate weighted score
@@ -95,22 +113,29 @@ class PortfolioManagerAgent(BaseAgent):
         # Normalize
         final_score = weighted_sum / total_weight if total_weight > 0 else 0.0
 
-        # Decision thresholds
-        min_confidence = self.config.get("min_confidence", 0.3)
+        # Apply kill zone bonus / non-optimal penalty
+        kill_zone = context.metadata.get("kill_zone")
+        if kill_zone:
+            final_score *= 1.1  # 10% confidence boost in kill zones
+        elif not context.metadata.get("optimal_time", True):
+            final_score *= 0.7  # 30% penalty outside optimal times
 
-        if final_score > 0.3:
+        # Decision thresholds (HIGHER than before - require stronger consensus)
+        min_confidence = self.config.get("min_confidence", 0.35)
+
+        if final_score > 0.4:  # Was 0.3 - now requires stronger consensus
             action = TradeAction.BUY
-            if final_score > 0.6:
+            if final_score > 0.7:
                 strength = SignalStrength.STRONG_BUY
-            elif final_score > 0.4:
+            elif final_score > 0.5:
                 strength = SignalStrength.BUY
             else:
                 strength = SignalStrength.WEAK_BUY
-        elif final_score < -0.3:
+        elif final_score < -0.4:  # Was -0.3
             action = TradeAction.SELL
-            if final_score < -0.6:
+            if final_score < -0.7:
                 strength = SignalStrength.STRONG_SELL
-            elif final_score < -0.4:
+            elif final_score < -0.5:
                 strength = SignalStrength.SELL
             else:
                 strength = SignalStrength.WEAK_SELL

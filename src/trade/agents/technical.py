@@ -92,6 +92,13 @@ class TechnicalAgent(BaseAgent):
             "indicator_summary": summary["signals"],
         }
 
+        # Store ATR for ExecutionAgent position sizing
+        atr_cols = [c for c in df_with_indicators.columns if c.startswith("atr_")]
+        if atr_cols:
+            atr_val = df_with_indicators[atr_cols[0]].iloc[-1]
+            if pd.notna(atr_val) and atr_val > 0:
+                context.metadata["atr"] = float(atr_val)
+
         # Store in context for other agents
         context.metadata["technical_trend"] = trend
         context.metadata["technical_signals"] = summary["signals"]

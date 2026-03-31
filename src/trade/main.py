@@ -10,10 +10,11 @@ import time
 from loguru import logger
 from rich.console import Console
 
-from trade.config import load_config, EnvSettings, TradingConfig
+from trade.config import load_config, TradingConfig
 from trade.agents.orchestrator import Orchestrator
+from trade.cache.store import CacheStore
 from trade.data.models import AssetType
-from trade.risk.circuit_breaker import CircuitBreaker
+from trade.risk.prop_firm import PropFirmRiskEngine, load_prop_firm_config
 from trade.utils.logging import setup_logging
 
 console = Console()
@@ -25,11 +26,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  trade --symbol AAPL                    Analyze a single stock
-  trade --symbol BTC-USD --type crypto   Analyze Bitcoin
-  trade --watchlist                      Analyze all configured symbols
-  trade --autonomous                     Run in autonomous mode
-  trade --backtest AAPL --start 2024-01-01 --end 2024-12-31
+  trade --symbol EURUSD=X                Analyze EUR/USD
+  trade --symbol XAUUSD=X --type forex   Analyze Gold
+  trade --watchlist                       Analyze all configured symbols
+  trade --demo                            Run in demo learning mode
+  trade --demo --interval 15              Demo every 15 minutes
+  trade --report                          Show analysis report
+  trade --autonomous                      Run in autonomous mode
         """,
     )
 
@@ -51,11 +54,22 @@ Examples:
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
+    # Demo mode
+    parser.add_argument("--demo", action="store_true", help="Run in demo learning mode (no trades)")
+    parser.add_argument("--interval", type=int, default=15, help="Demo interval in minutes (default: 15)")
+    parser.add_argument(
+        "--prop-firm", type=str, default="funderpro_classic_10k",
+        help="Prop firm config name (default: funderpro_classic_10k)"
+    )
+
+    # Reports
+    parser.add_argument("--report", action="store_true", help="Show analysis report")
+    parser.add_argument("--report-days", type=int, default=7, help="Report period in days (default: 7)")
+
     return parser.parse_args()
 
 
 def run_single_analysis(orchestrator: Orchestrator, symbol: str, asset_type: AssetType | None, as_json: bool) -> None:
-    """Run analysis on a single symbol."""
     if asset_type is None:
         if symbol.endswith("=X"):
             asset_type = AssetType.FOREX
@@ -67,7 +81,6 @@ def run_single_analysis(orchestrator: Orchestrator, symbol: str, asset_type: Ass
     result = orchestrator.analyze_symbol(symbol, asset_type)
 
     if as_json:
-        # Remove non-serializable data
         clean = {k: v for k, v in result.items() if k != "historical_df"}
         print(json.dumps(clean, indent=2, default=str))
     else:
@@ -75,60 +88,11 @@ def run_single_analysis(orchestrator: Orchestrator, symbol: str, asset_type: Ass
 
 
 def run_watchlist(orchestrator: Orchestrator, as_json: bool) -> None:
-    """Run analysis on the full watchlist."""
     results = orchestrator.analyze_watchlist()
-
     if as_json:
         print(json.dumps(results, indent=2, default=str))
     else:
         orchestrator.print_summary(results)
-
-
-def run_autonomous(orchestrator: Orchestrator, config: TradingConfig) -> None:
-    """Run in autonomous mode - continuously analyze and trade."""
-    interval = config.autonomous.scan_interval_seconds
-    circuit_breaker = CircuitBreaker(config.risk)
-
-    console.print(f"\n[bold red]{'='*60}[/bold red]")
-    console.print("[bold red]  AUTONOMOUS TRADING MODE ACTIVE[/bold red]")
-    console.print(f"[bold red]  Mode: {config.mode.upper()}[/bold red]")
-    console.print(f"[bold red]  Scan interval: {interval}s[/bold red]")
-    console.print(f"[bold red]{'='*60}[/bold red]\n")
-
-    if config.mode == "live" and config.autonomous.require_confirmation_for_live:
-        console.print("[bold red]WARNING: Live trading requires explicit confirmation![/bold red]")
-        confirm = input("Type 'CONFIRM LIVE TRADING' to proceed: ")
-        if confirm != "CONFIRM LIVE TRADING":
-            console.print("Aborted. Switching to paper mode.")
-            config.general["mode"] = "paper"
-
-    cycle = 0
-    while True:
-        cycle += 1
-        logger.info(f"=== Autonomous cycle {cycle} ===")
-
-        # Check circuit breaker
-        if not circuit_breaker.check(orchestrator.portfolio):
-            console.print("[red]Circuit breaker active - trading paused[/red]")
-            console.print(f"  Status: {circuit_breaker.status}")
-            time.sleep(interval)
-            continue
-
-        try:
-            results = orchestrator.analyze_watchlist()
-            orchestrator.print_summary(results)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Autonomous mode stopped by user[/yellow]")
-            break
-        except Exception as e:
-            logger.error(f"Error in autonomous cycle: {e}")
-
-        try:
-            logger.info(f"Sleeping {interval}s until next cycle...")
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Autonomous mode stopped by user[/yellow]")
-            break
 
 
 def main() -> None:
@@ -137,19 +101,54 @@ def main() -> None:
 
     # Load config
     config = load_config(args.config)
-
-    # Override mode if specified
     if args.mode:
         config.general["mode"] = args.mode
 
-    # Setup logging
     setup_logging(config.logging)
 
     console.print("[bold cyan]TRADE[/bold cyan] - Autonomous Multi-Agent Trading System v0.1.0")
     console.print(f"Mode: [{'green' if config.is_paper else 'red'}]{config.mode}[/{'green' if config.is_paper else 'red'}]")
 
-    # Create orchestrator
-    orchestrator = Orchestrator(config)
+    # =========================================================================
+    # DEMO MODE
+    # =========================================================================
+    if args.demo:
+        from trade.demo import DemoRunner
+
+        symbols = [args.symbol] if args.symbol else None
+        runner = DemoRunner(
+            config=config,
+            prop_firm=args.prop_firm,
+            interval_minutes=args.interval,
+            symbols=symbols,
+        )
+        runner.run()
+        return
+
+    # =========================================================================
+    # REPORT MODE
+    # =========================================================================
+    if args.report:
+        from trade.reports import ReportGenerator
+
+        reporter = ReportGenerator()
+        reporter.print_report(days=args.report_days)
+        return
+
+    # =========================================================================
+    # ANALYSIS MODES
+    # =========================================================================
+
+    # Initialize with prop firm risk engine
+    cache = CacheStore()
+    prop_config = load_prop_firm_config(args.prop_firm)
+    risk_engine = PropFirmRiskEngine(prop_config)
+
+    orchestrator = Orchestrator(
+        config=config,
+        risk_engine=risk_engine,
+        cache=cache,
+    )
 
     if args.backtest:
         from trade.backtesting.engine import BacktestEngine
@@ -162,10 +161,10 @@ def main() -> None:
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
-            console.print(f"\nBacktest result: {json.dumps(result['portfolio'], indent=2)}")
+            console.print(f"\nBacktest result: {json.dumps(result.get('portfolio', {}), indent=2)}")
 
     elif args.autonomous:
-        run_autonomous(orchestrator, config)
+        _run_autonomous(orchestrator, config)
 
     elif args.watchlist:
         run_watchlist(orchestrator, args.json)
@@ -175,9 +174,36 @@ def main() -> None:
         run_single_analysis(orchestrator, args.symbol, asset_type, args.json)
 
     else:
-        # Default: analyze a demo symbol
-        console.print("\nNo symbol specified. Running demo analysis on AAPL...")
-        run_single_analysis(orchestrator, "AAPL", AssetType.STOCK, args.json)
+        console.print("\nNo action specified. Use --help for options.")
+        console.print("  Quick start: [bold]python -m trade.main --demo[/bold]")
+
+
+def _run_autonomous(orchestrator: Orchestrator, config: TradingConfig) -> None:
+    """Run in autonomous mode."""
+    interval = config.autonomous.scan_interval_seconds
+
+    console.print(f"\n[bold red]{'='*60}[/bold red]")
+    console.print("[bold red]  AUTONOMOUS TRADING MODE[/bold red]")
+    console.print(f"[bold red]  Mode: {config.mode.upper()}[/bold red]")
+    console.print(f"[bold red]{'='*60}[/bold red]\n")
+
+    if config.mode == "live":
+        confirm = input("Type 'CONFIRM LIVE TRADING' to proceed: ")
+        if confirm != "CONFIRM LIVE TRADING":
+            console.print("Aborted.")
+            return
+
+    while True:
+        try:
+            results = orchestrator.analyze_watchlist()
+            orchestrator.print_summary(results)
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Stopped by user[/yellow]")
+            break
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            time.sleep(30)
 
 
 if __name__ == "__main__":

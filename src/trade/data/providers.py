@@ -13,9 +13,10 @@ from trade.data.models import AssetType, NewsItem, OHLCV, Quote
 class MarketDataProvider:
     """Unified market data provider supporting stocks, crypto, and forex."""
 
-    def __init__(self, provider: str = "yfinance"):
+    def __init__(self, provider: str = "yfinance", cache=None):
         self.provider = provider
         self._yf = None
+        self._cache = cache  # Optional CacheStore instance
 
     def _get_yfinance(self):
         if self._yf is None:
@@ -31,7 +32,17 @@ class MarketDataProvider:
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> pd.DataFrame:
-        """Fetch historical OHLCV data."""
+        """Fetch historical OHLCV data with optional caching."""
+        cache_key = f"ohlcv:{symbol}:{period}:{interval}"
+        ttl = 1.0 if interval == "1d" else 0.083  # 1h for daily, 5min for intraday
+
+        # Check cache first
+        if self._cache:
+            cached = self._cache.get_cached_df(cache_key)
+            if cached is not None and not cached.empty:
+                logger.debug(f"Cache HIT for {symbol} ({period}, {interval})")
+                return cached
+
         logger.info(f"Fetching historical data for {symbol} ({period}, {interval})")
         yf = self._get_yfinance()
         ticker = yf.Ticker(symbol)
@@ -51,6 +62,11 @@ class MarketDataProvider:
         # Normalize column names
         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
         df.index.name = "timestamp"
+
+        # Store in cache
+        if self._cache:
+            self._cache.set_cached_df(cache_key, df, ttl_hours=ttl)
+
         return df
 
     def get_realtime_quote(self, symbol: str) -> Quote | None:
