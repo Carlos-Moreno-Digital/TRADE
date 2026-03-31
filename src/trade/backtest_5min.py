@@ -86,15 +86,17 @@ class ScalpBacktester:
 
         for sym in symbols:
             try:
-                # Download 30 days of 5min data using start/end (not period)
                 df = yf.download(sym, start=start_date, end=end_date,
                                 interval="5m", progress=False)
                 if not df.empty and len(df) >= 200:
-                    # Normalize columns
-                    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+                    # Flatten MultiIndex columns from yf.download
+                    if hasattr(df.columns, 'levels'):
+                        df.columns = [c[0].lower() for c in df.columns]
+                    else:
+                        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
                     all_data[sym] = df
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed {sym}: {e}")
         console.print(f"  Got {len(all_data)}/{len(symbols)} symbols (5min, 30 days)\n")
 
         if not all_data:
