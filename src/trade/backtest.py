@@ -56,8 +56,8 @@ class Backtester:
         from trade.risk.prop_firm import load_prop_firm_config
         prop_config = load_prop_firm_config(prop_firm)
         self.account_size = prop_config.account_size
-        self.risk_per_trade = 0.0075  # 0.75% per trade (prop firm max)
-        self.max_trades = 3           # Up to 3 concurrent positions
+        self.risk_per_trade = 0.01    # 1% per trade - aggressive but within limits
+        self.max_trades = 4           # Up to 4 concurrent positions
         self.min_rr = 1.5             # Minimum 1.5:1 risk:reward
         self.top_n = top_n
 
@@ -390,27 +390,27 @@ class Backtester:
             confidence = 0.0
             net_score = bull_score - bear_score
 
-            # ONLY trade WITH the major trend
-            if major_trend == "bullish" and net_score >= 2 and bull_score >= 3:
+            # ONLY trade WITH the major trend (lowered thresholds for more trades)
+            if major_trend == "bullish" and net_score >= 2 and bull_score >= 2:
                 action = "buy"
-                confidence = min(0.9, bull_score * 0.1)
-            elif major_trend == "bearish" and net_score <= -2 and bear_score >= 3:
+                confidence = min(0.9, bull_score * 0.12)
+            elif major_trend == "bearish" and net_score <= -2 and bear_score >= 2:
                 action = "sell"
-                confidence = min(0.9, bear_score * 0.1)
-            # Counter-trend trades only on VERY strong signals
+                confidence = min(0.9, bear_score * 0.12)
+            # Counter-trend only on extreme signals
             elif major_trend == "bullish" and net_score <= -4 and bear_score >= 5:
-                action = "sell"  # Only short in uptrend with extreme signal
-                confidence = 0.4
+                action = "sell"
+                confidence = 0.35
             elif major_trend == "bearish" and net_score >= 4 and bull_score >= 5:
                 action = "buy"
-                confidence = 0.4
+                confidence = 0.35
 
             if action == "hold":
                 return None
 
-            # === TIGHTER SL/TP for prop firm (more trades, smaller moves) ===
-            sl_mult = 1.2   # Tighter SL (was 1.5) = less risk per trade
-            tp_mult = 2.0   # TP at 2x risk (was 3x) = hits more often
+            # === SL/TP optimized for prop firm ===
+            sl_mult = 1.2   # Tight SL = controlled risk
+            tp_mult = 2.5   # TP at 2.5x risk = good R:R, still achievable
 
             if action == "buy":
                 sl = latest - atr_val * sl_mult
@@ -555,12 +555,15 @@ class Backtester:
 
     def _get_default_symbols(self) -> list[str]:
         return [
-            # Forex majors + crosses (most liquid, tightest spreads)
-            "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
-            "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X", "EURAUD=X",
-            "GBPAUD=X", "GBPNZD=X", "AUDJPY=X", "NZDJPY=X", "CADJPY=X",
+            # Forex majors
+            "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDCHF=X",
+            # Forex crosses - more opportunities
+            "EURGBP=X", "EURJPY=X", "GBPJPY=X", "EURNZD=X", "EURAUD=X", "EURCAD=X", "EURCHF=X",
+            "GBPAUD=X", "GBPNZD=X", "GBPCAD=X", "GBPCHF=X",
+            "AUDJPY=X", "NZDJPY=X", "CADJPY=X", "CHFJPY=X",
+            "AUDNZD=X", "AUDCAD=X",
             # Commodities
-            "GC=F", "SI=F", "CL=F",
+            "GC=F", "SI=F", "CL=F", "PL=F",
             # Crypto
             "BTC-USD", "ETH-USD",
         ]
