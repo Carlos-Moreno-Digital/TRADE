@@ -67,6 +67,7 @@ Examples:
     parser.add_argument("--scalp-validate", action="store_true", help="Validate scalp on 10 random dates from 2 years")
     parser.add_argument("--massive", action="store_true", help="Run massive multi-timeframe backtest (1H+Daily+5min+sweep)")
     parser.add_argument("--ml", action="store_true", help="Run ML-powered backtest (XGBoost + StatArb + Ensemble)")
+    parser.add_argument("--ml-live", action="store_true", help="Run ML live paper trader (no broker, uses yfinance prices)")
 
     # Scanner
     parser.add_argument("--top-n", type=int, default=3, help="Number of top candidates to deep analyze (default: 3)")
@@ -138,6 +139,11 @@ def main() -> None:
     # =========================================================================
     # SCALP BACKTEST MODE
     # =========================================================================
+    if args.ml_live:
+        from trade.ml_live import run_live_paper
+        run_live_paper()
+        return
+
     if args.ml:
         from trade.ml_backtest import MLBacktester
         bt = MLBacktester()
