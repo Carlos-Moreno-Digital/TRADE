@@ -296,6 +296,20 @@ def run_live_paper():
 
                 signal = _predict_now(model, scaler, df_combined, sym)
                 if signal is None:
+                    # Log what the model is thinking (diagnostic)
+                    try:
+                        feat = _build_features(df_combined)
+                        d = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
+                        X = scaler.transform(d.iloc[[-1]])
+                        proba = model.predict_proba(X)[0]
+                        y_inv = {0: "SHORT", 1: "NEUTRAL", 2: "LONG"}
+                        best = int(proba.argmax())
+                        console.print(
+                            f"  [dim]{sym}: {y_inv[best]} ({proba[best]:.1%}) | "
+                            f"S:{proba[0]:.1%} N:{proba[1]:.1%} L:{proba[2]:.1%}[/dim]"
+                        )
+                    except Exception:
+                        pass
                     continue
 
                 # Execute paper trade
