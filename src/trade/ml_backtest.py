@@ -253,10 +253,10 @@ class MLBacktester:
         test_bars = 500
         purge_bars = 24  # Must be > 3x target horizon (8) to prevent leakage
 
-        # Symbols with PROVEN edge (tested all 8, only these 2 consistently profitable):
-        # EURJPY: +$647 to +$5,495 across runs (strongest, most consistent)
-        # USDCAD: +$392 to +$1,773 (solid, positive in most configs)
-        ml_symbols = ["EURJPY=X", "USDCAD=X"]
+        # Symbols with PROVEN edge (tested 29 instruments, these 6 profitable):
+        # Massive scan results: GBPNZD +$3,098, GC=F +$3,058, AUDNZD +$2,927
+        # GBPCHF +$780, USDCAD +$577, USDCHF +$441
+        ml_symbols = ["GBPNZD=X", "GC=F", "AUDNZD=X", "GBPCHF=X", "USDCAD=X", "USDCHF=X"]
 
         for sym in ml_symbols:
             df = all_data.get(sym)

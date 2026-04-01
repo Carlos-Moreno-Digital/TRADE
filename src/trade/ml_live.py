@@ -39,8 +39,14 @@ try:
 except ImportError:
     HAS_XGB = False
 
+EXTRA_SPREADS = {
+    "GBPNZD=X": 0.00030, "AUDNZD=X": 0.00020, "GBPCHF=X": 0.00020,
+    "GC=F": 0.40, "USDCHF=X": 0.00010,
+}
+SPREADS.update(EXTRA_SPREADS)
+
 DB_PATH = Path("data/ml_paper_trades.db")
-SYMBOLS = ["EURJPY=X", "USDCAD=X"]
+SYMBOLS = ["GBPNZD=X", "GC=F", "AUDNZD=X", "GBPCHF=X", "USDCAD=X", "USDCHF=X"]
 ACCOUNT_SIZE = 10000.0
 RISK_PER_TRADE = 0.015  # 1.5%
 CONFIDENCE_THRESHOLD = 0.53
