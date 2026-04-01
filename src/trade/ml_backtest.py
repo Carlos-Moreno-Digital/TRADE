@@ -280,10 +280,12 @@ class MLBacktester:
             sym_wins = 0
             sym_pnl = 0.0
 
-            # Walk-forward windows
+            # Walk-forward with ROLLING window (fixed training size)
+            # More realistic than expanding window for live deployment
             i = train_bars
             while i + test_bars <= len(data):
-                train_data = data.iloc[:i - purge_bars]
+                train_start = max(0, i - purge_bars - train_bars)
+                train_data = data.iloc[train_start:i - purge_bars]
                 test_data = data.iloc[i:i + test_bars]
 
                 X_train = train_data.drop(columns=["target"]).fillna(0)
