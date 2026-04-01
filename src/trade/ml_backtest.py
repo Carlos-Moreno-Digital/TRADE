@@ -227,8 +227,8 @@ class MLBacktester:
         if mode in ("statarb", "full") and HAS_STATSMODELS:
             results["statarb"] = self._run_statarb(all_data)
 
-        if mode == "full" and "ml" in results and "statarb" in results:
-            results["ensemble"] = self._run_ensemble(results["ml"], results["statarb"])
+        # Note: StatArb shown for research but NOT combined with ML
+        # (StatArb has 61% WR but negative P&L due to small wins/large losses)
 
         # Final report
         self._final_report(results)
@@ -253,7 +253,9 @@ class MLBacktester:
         test_bars = 500
         purge_bars = 24  # Must be > 3x target horizon (8) to prevent leakage
 
-        # Only symbols with PROVEN edge in walk-forward (EURJPY=star, USDCAD=solid)
+        # Symbols with PROVEN edge (tested all 8, only these 2 consistently profitable):
+        # EURJPY: +$647 to +$5,495 across runs (strongest, most consistent)
+        # USDCAD: +$392 to +$1,773 (solid, positive in most configs)
         ml_symbols = ["EURJPY=X", "USDCAD=X"]
 
         for sym in ml_symbols:
@@ -305,11 +307,13 @@ class MLBacktester:
                         subsample=0.8, colsample_bytree=0.8,
                         min_child_weight=5, reg_alpha=0.1, reg_lambda=1.0,
                         eval_metric="mlogloss", verbosity=0,
+                        random_state=42, seed=42,
                     )
                 else:
                     model = GradientBoostingClassifier(
                         n_estimators=250, max_depth=4, learning_rate=0.04,
                         subsample=0.8, min_samples_leaf=20,
+                        random_state=42,
                     )
 
                 try:
@@ -345,7 +349,7 @@ class MLBacktester:
 
                     # Confidence filter (lower = more trades, higher = more selective)
                     max_prob = float(avg_proba[j].max())
-                    if max_prob < 0.52:
+                    if max_prob < 0.53:
                         continue
 
                     price = float(close_prices[j])
