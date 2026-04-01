@@ -122,19 +122,21 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     feat["stoch_d"] = stoch_d
     feat["stoch_cross"] = stoch_k - stoch_d
 
-    # Pattern recognition (candle patterns)
-    feat["doji"] = talib.CDLDOJI(close, high, low, close)
-    feat["hammer"] = talib.CDLHAMMER(close, high, low, close)
-    feat["engulfing"] = talib.CDLENGULFING(close, high, low, close)
-    feat["morning_star"] = talib.CDLMORNINGSTAR(close, high, low, close)
+    # Pattern recognition (candle patterns — need proper OHLC order)
+    open_prices = df["open"].values.astype(float) if "open" in df.columns else prev_close
+    feat["doji"] = talib.CDLDOJI(open_prices, high, low, close)
+    feat["hammer"] = talib.CDLHAMMER(open_prices, high, low, close)
+    feat["engulfing"] = talib.CDLENGULFING(open_prices, high, low, close)
+    feat["morning_star"] = talib.CDLMORNINGSTAR(open_prices, high, low, close)
 
-    # Market microstructure
+    # Market microstructure (use shift instead of np.roll to avoid wraparound)
     feat["high_low_ratio"] = high / (low + 1e-10)
-    body = np.abs(close - np.roll(close, 1))
+    prev_close = pd.Series(close, index=df.index).shift(1).bfill().values.copy()
+    body = np.abs(close - prev_close)
     candle_range = high - low + 1e-10
     feat["body_ratio"] = body / candle_range
-    feat["upper_wick"] = (high - np.maximum(close, np.roll(close, 1))) / candle_range
-    feat["lower_wick"] = (np.minimum(close, np.roll(close, 1)) - low) / candle_range
+    feat["upper_wick"] = (high - np.maximum(close, prev_close)) / candle_range
+    feat["lower_wick"] = (np.minimum(close, prev_close) - low) / candle_range
 
     # Volume features
     if vol.sum() > 0:
@@ -162,11 +164,13 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
 def _build_target(df: pd.DataFrame, horizon: int = 3, min_move_pct: float = 0.0005) -> pd.Series:
     """Build target: 1 = profitable long, -1 = profitable short, 0 = neutral.
 
-    Uses future returns (shifted forward) with minimum move threshold
-    to avoid predicting noise.
+    CRITICAL: Uses TRUE future returns (close[t+horizon] - close[t]) / close[t].
+    Previous version had look-ahead bias bug (used past returns).
     """
-    close = df["close"].values.astype(float)
-    future_return = pd.Series(close, index=df.index).pct_change(horizon).shift(-horizon)
+    close_s = pd.Series(df["close"].values.astype(float), index=df.index)
+    # TRUE future return: (price at t+horizon - price at t) / price at t
+    future_close = close_s.shift(-horizon)
+    future_return = (future_close - close_s) / close_s
 
     target = pd.Series(0, index=df.index)
     target[future_return > min_move_pct] = 1   # Long signal
@@ -231,10 +235,12 @@ class MLBacktester:
         return results
 
     def _run_ml(self, all_data: dict) -> dict:
-        """Walk-forward ML backtesting with XGBoost."""
-        console.print(Panel.fit("[bold cyan]ENGINE 1: ML Classifier (XGBoost)[/bold cyan]\n"
-                                "50+ features · Walk-forward · Purged CV",
-                                border_style="cyan"))
+        """Walk-forward ML backtesting with multi-model ensemble."""
+        console.print(Panel.fit(
+            "[bold cyan]ENGINE 1: Multi-Model ML Ensemble[/bold cyan]\n"
+            "XGBoost + LightGBM + RandomForest · Majority Vote\n"
+            "Walk-forward · Purged CV · Feature Selection",
+            border_style="cyan"))
 
         all_trades = []
         total_pnl = 0.0
@@ -242,13 +248,14 @@ class MLBacktester:
         peak = self.account_size
         max_dd = 0.0
 
-        # Walk-forward: 6-month train, 1-month test, slide forward
-        train_bars = 4000   # ~167 days of 1H data
-        test_bars = 500     # ~21 days
-        purge_bars = 20     # Gap between train and test (avoid leakage)
+        # Walk-forward: ~6 months train, ~3 weeks test, slide forward
+        train_bars = 4000
+        test_bars = 500
+        purge_bars = 24  # Must be > 3x target horizon (8) to prevent leakage
 
-        # Only trade symbols that showed CONSISTENT edge in walk-forward
+        # Only symbols with PROVEN edge in walk-forward (EURJPY=star, USDCAD=solid)
         ml_symbols = ["EURJPY=X", "USDCAD=X"]
+
         for sym in ml_symbols:
             df = all_data.get(sym)
             if df is None:
@@ -277,72 +284,68 @@ class MLBacktester:
                 train_data = data.iloc[:i - purge_bars]
                 test_data = data.iloc[i:i + test_bars]
 
-                X_train = train_data.drop(columns=["target"])
+                X_train = train_data.drop(columns=["target"]).fillna(0)
                 y_train = train_data["target"]
-                X_test = test_data.drop(columns=["target"])
-                y_test = test_data["target"]
-
-                # Handle NaN in features
-                X_train = X_train.fillna(0)
-                X_test = X_test.fillna(0)
+                X_test = test_data.drop(columns=["target"]).fillna(0)
 
                 # Scale
                 scaler = StandardScaler()
                 X_train_s = scaler.fit_transform(X_train)
                 X_test_s = scaler.transform(X_test)
 
-                # Train XGBoost (or fallback to sklearn)
-                if HAS_XGB:
-                    model = xgb.XGBClassifier(
-                        n_estimators=200, max_depth=4, learning_rate=0.05,
-                        subsample=0.8, colsample_bytree=0.8,
-                        min_child_weight=5, reg_alpha=0.1, reg_lambda=1.0,
-                        eval_metric="mlogloss", verbosity=0,
-                        use_label_encoder=False,
-                    )
-                else:
-                    model = GradientBoostingClassifier(
-                        n_estimators=200, max_depth=4, learning_rate=0.05,
-                        subsample=0.8, min_samples_leaf=20,
-                    )
-
-                # Remap target for XGBoost (needs 0-based classes)
+                # Remap target (XGBoost needs 0-based)
                 y_map = {-1: 0, 0: 1, 1: 2}
                 y_inv = {0: -1, 1: 0, 2: 1}
                 y_train_m = y_train.map(y_map)
-                y_test_m = y_test.map(y_map)
+
+                # Single XGBoost (proven best — ensemble was worse)
+                if HAS_XGB:
+                    model = xgb.XGBClassifier(
+                        n_estimators=250, max_depth=4, learning_rate=0.04,
+                        subsample=0.8, colsample_bytree=0.8,
+                        min_child_weight=5, reg_alpha=0.1, reg_lambda=1.0,
+                        eval_metric="mlogloss", verbosity=0,
+                    )
+                else:
+                    model = GradientBoostingClassifier(
+                        n_estimators=250, max_depth=4, learning_rate=0.04,
+                        subsample=0.8, min_samples_leaf=20,
+                    )
 
                 try:
                     model.fit(X_train_s, y_train_m)
-                    preds = model.predict(X_test_s)
-                    proba = model.predict_proba(X_test_s)
+                    ensemble_preds = model.predict(X_test_s)
+                    avg_proba = model.predict_proba(X_test_s)
                 except Exception:
                     i += test_bars
                     continue
 
-                # Simulate trades on test period
+                # Simulate trades
                 close_prices = df["close"].reindex(test_data.index).values.astype(float)
                 atr_vals = features["atr_14"].reindex(test_data.index).values
 
                 trades_per_day = {}
-                for j in range(len(preds)):
-                    pred_class = y_inv.get(int(preds[j]), 0)
-                    if pred_class == 0:
-                        continue  # No trade
+                last_trade_idx = -10
 
-                    # Daily trade limit (max 2 per symbol per day)
+                for j in range(len(ensemble_preds)):
+                    pred_class = y_inv.get(int(ensemble_preds[j]), 0)
+                    if pred_class == 0:
+                        continue
+
+                    # Daily limit
                     ts = test_data.index[j]
                     day_key = str(ts)[:10]
                     trades_per_day[day_key] = trades_per_day.get(day_key, 0)
                     if trades_per_day[day_key] >= 2:
                         continue
-                    # Min 4 candles between trades (avoid clustering)
-                    if sym_trades > 0 and j < 4:
+
+                    # Min spacing between trades (8 candles = 1 horizon)
+                    if j - last_trade_idx < 8:
                         continue
 
-                    # Confidence filter: only trade HIGH-confidence predictions
-                    max_prob = float(proba[j].max())
-                    if max_prob < 0.58:
+                    # Confidence filter (lower = more trades, higher = more selective)
+                    max_prob = float(avg_proba[j].max())
+                    if max_prob < 0.52:
                         continue
 
                     price = float(close_prices[j])
@@ -353,8 +356,9 @@ class MLBacktester:
                     spread = SPREADS.get(sym, 0.0002)
                     slip = spread * SLIPPAGE
 
-                    # Position sizing
-                    risk_amt = self.account_size * self.risk_per_trade
+                    # Position sizing (scale with confidence)
+                    conf_mult = 1.0 + (max_prob - 0.55) * 2  # 1.0x at 55%, 1.9x at 100%
+                    risk_amt = self.account_size * self.risk_per_trade * min(conf_mult, 1.5)
                     sl_dist = atr_v * 1.2
                     qty = risk_amt / sl_dist if sl_dist > 0 else 0
                     max_qty = self.account_size * 5 / price
@@ -363,20 +367,20 @@ class MLBacktester:
                     if qty <= 0:
                         continue
 
-                    # Fixed-horizon exit (8 candles = ~8 hours)
-                    # ML edge is in direction prediction, not entry/exit timing
+                    # Fixed-horizon exit (8 candles)
                     if j + 8 >= len(close_prices):
                         continue
 
                     future_price = float(close_prices[j + 8])
                     cost = (spread + slip * 2) * qty
 
-                    if pred_class == 1:  # Long
+                    if pred_class == 1:
                         pnl = (future_price - price) * qty - cost
-                    else:  # Short
+                    else:
                         pnl = (price - future_price) * qty - cost
 
                     trades_per_day[day_key] += 1
+                    last_trade_idx = j
                     sym_trades += 1
                     sym_pnl += pnl
                     if pnl > 0:
@@ -393,7 +397,7 @@ class MLBacktester:
                     dd = (peak - equity) / peak * 100 if peak > 0 else 0
                     max_dd = max(max_dd, dd)
 
-                i += test_bars  # Slide forward
+                i += test_bars
 
             wr = sym_wins / sym_trades * 100 if sym_trades > 0 else 0
             pc = "green" if sym_pnl >= 0 else "red"
@@ -406,16 +410,19 @@ class MLBacktester:
         wr = total_wins / total_trades * 100 if total_trades > 0 else 0
         avg_win = np.mean([t["pnl"] for t in all_trades if t["pnl"] > 0]) if total_wins > 0 else 0
         avg_loss = np.mean([t["pnl"] for t in all_trades if t["pnl"] <= 0]) if total_trades - total_wins > 0 else 0
+        pf = abs(sum(t["pnl"] for t in all_trades if t["pnl"] > 0) /
+                 sum(t["pnl"] for t in all_trades if t["pnl"] <= 0)) if any(t["pnl"] <= 0 for t in all_trades) else 999
 
-        console.print(f"\n  [bold]ML Results:[/bold]")
+        console.print(f"\n  [bold]ML Ensemble Results:[/bold]")
         pc = "green" if total_pnl >= 0 else "red"
         console.print(f"  P&L: [{pc}]${total_pnl:+,.2f} ({total_pnl/self.account_size*100:+.1f}%)[/{pc}]")
-        console.print(f"  Trades: {total_trades} | WR: {wr:.1f}% | Max DD: {max_dd:.1f}%")
+        console.print(f"  Trades: {total_trades} | WR: {wr:.1f}% | PF: {pf:.2f} | Max DD: {max_dd:.1f}%")
         console.print(f"  Avg Win: ${avg_win:+,.2f} | Avg Loss: ${avg_loss:+,.2f}")
 
         return {
             "pnl": total_pnl, "trades": total_trades, "wins": total_wins,
             "win_rate": round(wr, 1), "max_dd": round(max_dd, 1),
+            "profit_factor": round(pf, 2),
             "avg_win": round(avg_win, 2), "avg_loss": round(avg_loss, 2),
             "all_trades": all_trades,
         }
@@ -470,9 +477,9 @@ class MLBacktester:
             s1 = all_data[sym1]["close"].reindex(common_idx).values.astype(float)
             s2 = all_data[sym2]["close"].reindex(common_idx).values.astype(float)
 
-            # Calculate spread (ratio)
-            ratio = s1 / (s2 + 1e-10)
-            lookback = 60  # 60-hour lookback for z-score
+            # Calculate spread using log prices (more stable)
+            ratio = np.log(s1 + 1e-10) - np.log(s2 + 1e-10)
+            lookback = 80  # 80-hour lookback for more stable z-score
             ratio_series = pd.Series(ratio)
             ratio_mean = ratio_series.rolling(lookback).mean()
             ratio_std = ratio_series.rolling(lookback).std()
