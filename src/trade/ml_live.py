@@ -266,7 +266,7 @@ def run_live_paper():
 
                 # Download latest 5 days of 1H data for prediction
                 try:
-                    df_latest = yf.download(sym, period="5d", interval="1h", progress=False)
+                    df_latest = yf.download(sym, period="1mo", interval="1h", progress=False)
                     if df_latest.empty:
                         continue
                     if hasattr(df_latest.columns, 'levels'):
