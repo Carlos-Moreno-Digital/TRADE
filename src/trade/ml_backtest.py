@@ -179,7 +179,7 @@ class MLBacktester:
 
     def __init__(self, account_size: float = 10000):
         self.account_size = account_size
-        self.risk_per_trade = 0.015  # 1.5% risk (ML has validated edge)
+        self.risk_per_trade = 0.015  # 1.5% risk (validated edge)
 
     def run(self, mode: str = "full") -> dict[str, Any]:
         """Run ML backtesting pipeline.
@@ -363,7 +363,8 @@ class MLBacktester:
                     if qty <= 0:
                         continue
 
-                    # Check outcome after horizon (8 candles = ~8 hours)
+                    # Fixed-horizon exit (8 candles = ~8 hours)
+                    # ML edge is in direction prediction, not entry/exit timing
                     if j + 8 >= len(close_prices):
                         continue
 
