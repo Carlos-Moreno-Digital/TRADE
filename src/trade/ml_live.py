@@ -48,10 +48,19 @@ SPREADS.update(EXTRA_SPREADS)
 DB_PATH = Path("data/ml_paper_trades.db")
 SYMBOLS = ["GBPNZD=X", "GC=F", "AUDNZD=X", "GBPCHF=X", "USDCAD=X", "USDCHF=X"]
 ACCOUNT_SIZE = 10000.0
-RISK_PER_TRADE = 0.015  # 1.5%
+
+# === FUNDERPRO PROP FIRM RULES ===
+RISK_PER_TRADE = 0.0075  # 0.75% max (firm rule)
 CONFIDENCE_THRESHOLD = 0.53
 HORIZON = 8  # 8-hour prediction horizon
-CHECK_INTERVAL = 300  # Check every 5 minutes for new candles
+CHECK_INTERVAL = 300  # Check every 5 minutes
+MAX_OPEN_TRADES = 2  # FunderPro: max 2 concurrent
+MAX_TRADES_PER_DAY = 4  # FunderPro: max 4/day
+MAX_DAILY_LOSS_PCT = 3.0  # Hard stop 3% (firm: 5%, safety: 4%)
+MAX_TOTAL_DD_PCT = 7.0  # Hard stop 7% (firm: 10%, safety: 8%)
+CONSEC_LOSS_COOLDOWN = 3600  # 60 min cooldown after 2 consecutive losses
+SL_ATR_MULT = 1.5  # Stop loss at 1.5x ATR
+TP_ATR_MULT = 2.5  # Take profit at 2.5x ATR → R:R = 1.67 (min 1.5)
 
 
 def _init_db():
@@ -65,12 +74,15 @@ def _init_db():
             symbol TEXT NOT NULL,
             action TEXT NOT NULL,
             entry_price REAL NOT NULL,
+            stop_loss REAL,
+            take_profit REAL,
             predicted_exit_price REAL,
             actual_exit_price REAL,
             quantity REAL NOT NULL,
             confidence REAL NOT NULL,
             pnl REAL,
             status TEXT DEFAULT 'open',
+            exit_reason TEXT,
             horizon_end TEXT,
             spread_cost REAL,
             notes TEXT
@@ -104,6 +116,20 @@ def _get_account_stats(conn) -> dict:
     total_pnl = row[2] or 0.0
     open_count = row[3] or 0
     wr = wins / total * 100 if total > 0 else 0
+    # Daily P&L
+    today = datetime.now().strftime("%Y-%m-%d")
+    cur2 = conn.execute("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades WHERE timestamp LIKE ? AND status='closed'", (today + "%",))
+    row2 = cur2.fetchone()
+    daily_pnl = row2[0] or 0.0
+    daily_trades = row2[1] or 0
+    # Today's total trades (open + closed)
+    cur3 = conn.execute("SELECT COUNT(*) FROM trades WHERE timestamp LIKE ?", (today + "%",))
+    trades_today = cur3.fetchone()[0] or 0
+    # Consecutive losses
+    cur4 = conn.execute("SELECT pnl FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 2")
+    recent = [r[0] for r in cur4.fetchall()]
+    consec_losses = len(recent) == 2 and all(p < 0 for p in recent)
+
     return {
         "total_trades": total,
         "wins": wins,
@@ -111,6 +137,10 @@ def _get_account_stats(conn) -> dict:
         "open_trades": open_count,
         "win_rate": wr,
         "balance": ACCOUNT_SIZE + total_pnl,
+        "daily_pnl": daily_pnl,
+        "daily_trades": daily_trades,
+        "trades_today": trades_today,
+        "consec_losses": consec_losses,
     }
 
 
@@ -208,9 +238,9 @@ def run_live_paper():
     console.print(Panel.fit(
         "[bold green]ML LIVE PAPER TRADER[/bold green]\n"
         f"Symbols: {', '.join(SYMBOLS)}\n"
-        f"Risk: {RISK_PER_TRADE*100:.1f}% per trade | Horizon: {HORIZON}h\n"
-        f"Account: ${ACCOUNT_SIZE:,.0f} (paper)\n"
-        f"Confidence threshold: {CONFIDENCE_THRESHOLD}\n\n"
+        f"Risk: {RISK_PER_TRADE*100:.2f}% per trade | SL: {SL_ATR_MULT}x ATR | TP: {TP_ATR_MULT}x ATR\n"
+        f"Account: ${ACCOUNT_SIZE:,.0f} (paper) | Max {MAX_OPEN_TRADES} open | Max {MAX_TRADES_PER_DAY}/day\n"
+        f"DD limits: {MAX_DAILY_LOSS_PCT}% daily / {MAX_TOTAL_DD_PCT}% total\n\n"
         "[dim]No broker needed — uses yfinance real-time prices[/dim]\n"
         "[dim]Ctrl+C to stop. All trades saved to data/ml_paper_trades.db[/dim]",
         title="Live Paper Trading",
@@ -265,12 +295,50 @@ def run_live_paper():
                         last_train[sym] = now
                         console.print("[green]OK[/green]")
 
+            # === PROP FIRM RISK CHECKS ===
+            # Total drawdown kill switch
+            if stats["total_pnl"] < 0 and abs(stats["total_pnl"]) / ACCOUNT_SIZE * 100 >= MAX_TOTAL_DD_PCT:
+                console.print(f"  [red bold]KILL SWITCH: Total DD {abs(stats['total_pnl'])/ACCOUNT_SIZE*100:.1f}% >= {MAX_TOTAL_DD_PCT}%. NO TRADING.[/red bold]")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # Daily loss limit
+            if stats["daily_pnl"] < 0 and abs(stats["daily_pnl"]) / ACCOUNT_SIZE * 100 >= MAX_DAILY_LOSS_PCT:
+                console.print(f"  [red]Daily loss limit hit ({abs(stats['daily_pnl'])/ACCOUNT_SIZE*100:.1f}%). Waiting for tomorrow.[/red]")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # Weekend check (no holding over weekend — close Friday 20:00 UTC)
+            if now.weekday() == 4 and now.hour >= 20:
+                console.print("  [yellow]Friday close — no new trades. Weekend rule.[/yellow]")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # Consecutive losses cooldown
+            if stats["consec_losses"]:
+                cur_cool = conn.execute("SELECT timestamp FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 1")
+                last_loss_row = cur_cool.fetchone()
+                if last_loss_row:
+                    last_loss_time = datetime.fromisoformat(last_loss_row[0])
+                    cooldown_left = CONSEC_LOSS_COOLDOWN - (now - last_loss_time).total_seconds()
+                    if cooldown_left > 0:
+                        console.print(f"  [yellow]Cooldown: {int(cooldown_left/60)}min left after 2 consecutive losses[/yellow]")
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+
             # Check for new signals
             for sym in SYMBOLS:
                 if sym not in models:
                     continue
 
-                # Download latest 5 days of 1H data for prediction
+                # Max open trades check
+                if stats["open_trades"] >= MAX_OPEN_TRADES:
+                    break
+
+                # Max daily trades check
+                if stats["trades_today"] >= MAX_TRADES_PER_DAY:
+                    break
+
                 try:
                     df_latest = yf.download(sym, period="1mo", interval="1h", progress=False)
                     if df_latest.empty:
@@ -285,24 +353,21 @@ def run_live_paper():
                 # Check if we have a new candle
                 latest_ts = str(df_latest.index[-1])
                 if latest_ts == last_candle.get(sym):
-                    continue  # Same candle, skip
+                    continue
                 last_candle[sym] = latest_ts
 
-                # Check if we already have an open trade on this symbol
+                # No duplicate positions
                 cur = conn.execute("SELECT COUNT(*) FROM trades WHERE symbol=? AND status='open'", (sym,))
                 if cur.fetchone()[0] > 0:
-                    continue  # Already have open trade
+                    continue
 
-                # Combine historical + latest for features
                 model, scaler, df_hist = models[sym]
-                # Use the latest data for prediction
                 df_combined = df_latest
                 if len(df_combined) < 50:
                     continue
 
                 signal = _predict_now(model, scaler, df_combined, sym)
                 if signal is None:
-                    # Log what the model is thinking (diagnostic)
                     try:
                         feat = _build_features(df_combined)
                         d = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -318,33 +383,52 @@ def run_live_paper():
                         pass
                     continue
 
-                # Execute paper trade
+                # === POSITION SIZING WITH SL/TP (PROP FIRM COMPLIANT) ===
+                price = signal["price"]
+                atr = signal["atr"]
                 spread = SPREADS.get(sym, 0.0002)
                 slip = spread * SLIPPAGE
-                risk_amt = ACCOUNT_SIZE * RISK_PER_TRADE
-                sl_dist = signal["atr"] * 1.2
+
+                # SL/TP based on ATR
+                sl_dist = atr * SL_ATR_MULT
+                tp_dist = atr * TP_ATR_MULT
+
+                if signal["action"] == "BUY":
+                    sl_price = price - sl_dist
+                    tp_price = price + tp_dist
+                else:
+                    sl_price = price + sl_dist
+                    tp_price = price - tp_dist
+
+                # Position sizing: risk 0.75% of account
+                risk_amt = stats["balance"] * RISK_PER_TRADE
                 qty = risk_amt / sl_dist if sl_dist > 0 else 0
-                max_qty = ACCOUNT_SIZE * 5 / signal["price"]
+                max_qty = stats["balance"] * 5 / price if price > 0 else 0
                 qty = min(qty, max_qty)
                 cost = (spread + slip * 2) * qty
+
+                if qty <= 0:
+                    continue
 
                 horizon_end = (now + timedelta(hours=HORIZON)).isoformat()
 
                 conn.execute(
-                    "INSERT INTO trades (timestamp, symbol, action, entry_price, quantity, "
-                    "confidence, status, horizon_end, spread_cost, notes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
-                    (now.isoformat(), sym, signal["action"], signal["price"],
+                    "INSERT INTO trades (timestamp, symbol, action, entry_price, "
+                    "stop_loss, take_profit, quantity, confidence, status, "
+                    "horizon_end, spread_cost, notes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
+                    (now.isoformat(), sym, signal["action"], price,
+                     round(sl_price, 5), round(tp_price, 5),
                      round(qty, 4), signal["confidence"], horizon_end, round(cost, 2),
-                     f"pred_class={signal['pred_class']}, atr={signal['atr']:.5f}")
+                     f"atr={atr:.5f}, R:R={tp_dist/sl_dist:.2f}")
                 )
                 conn.commit()
 
                 action_color = "green" if signal["action"] == "BUY" else "red"
                 console.print(
-                    f"\n  [{action_color}]>>> {signal['action']} {sym} @ {signal['price']:.4f} "
-                    f"| Conf: {signal['confidence']:.1%} | Qty: {qty:.2f} "
-                    f"| Exit in ~{HORIZON}h[/{action_color}]"
+                    f"\n  [{action_color}]>>> {signal['action']} {sym} @ {price:.4f} "
+                    f"| SL: {sl_price:.4f} | TP: {tp_price:.4f} "
+                    f"| Conf: {signal['confidence']:.1%} | Qty: {qty:.2f}[/{action_color}]"
                 )
 
             time.sleep(CHECK_INTERVAL)
@@ -362,15 +446,18 @@ def run_live_paper():
 
 
 def _check_exits(conn, models):
-    """Check open trades and close those past their horizon."""
-    now = datetime.now().isoformat()
+    """Check open trades for SL/TP hits and time exits."""
+    now_str = datetime.now().isoformat()
+    now = datetime.now()
+
+    # Get ALL open trades
     cur = conn.execute(
-        "SELECT id, symbol, action, entry_price, quantity, spread_cost, horizon_end "
-        "FROM trades WHERE status='open' AND horizon_end <= ?", (now,)
+        "SELECT id, symbol, action, entry_price, stop_loss, take_profit, "
+        "quantity, spread_cost, horizon_end FROM trades WHERE status='open'"
     )
 
     for row in cur.fetchall():
-        trade_id, sym, action, entry_price, qty, cost, _ = row
+        trade_id, sym, action, entry_price, sl, tp, qty, cost, horizon_end = row
 
         # Get current price
         try:
@@ -378,47 +465,93 @@ def _check_exits(conn, models):
             if df.empty:
                 continue
             if hasattr(df.columns, 'levels'):
-                exit_price = float(df[[c for c in df.columns if c[0].lower() == 'close'][0]].iloc[-1])
+                cols = {c[0].lower(): c for c in df.columns}
+                current_high = float(df[cols.get('high', cols.get('close'))].iloc[-1])
+                current_low = float(df[cols.get('low', cols.get('close'))].iloc[-1])
+                current_close = float(df[cols.get('close')].iloc[-1])
             else:
-                exit_price = float(df["close" if "close" in df.columns else "Close"].iloc[-1])
+                current_high = float(df.get("high", df["close"]).iloc[-1])
+                current_low = float(df.get("low", df["close"]).iloc[-1])
+                current_close = float(df.get("close", df["Close"]).iloc[-1])
         except Exception:
             continue
 
+        exit_price = None
+        exit_reason = None
+
+        # Check SL hit
+        if sl and sl > 0:
+            if action == "BUY" and current_low <= sl:
+                exit_price = sl
+                exit_reason = "SL"
+            elif action == "SELL" and current_high >= sl:
+                exit_price = sl
+                exit_reason = "SL"
+
+        # Check TP hit
+        if tp and tp > 0 and exit_price is None:
+            if action == "BUY" and current_high >= tp:
+                exit_price = tp
+                exit_reason = "TP"
+            elif action == "SELL" and current_low <= tp:
+                exit_price = tp
+                exit_reason = "TP"
+
+        # Time exit (horizon reached)
+        if exit_price is None and horizon_end and now_str >= horizon_end:
+            exit_price = current_close
+            exit_reason = "TIME"
+
+        # Weekend close (Friday 20:00+ UTC)
+        if exit_price is None and now.weekday() == 4 and now.hour >= 20:
+            exit_price = current_close
+            exit_reason = "WEEKEND"
+
+        if exit_price is None:
+            continue
+
         # Calculate P&L
+        cost = cost or 0
         if action == "BUY":
             pnl = (exit_price - entry_price) * qty - cost
         else:
             pnl = (entry_price - exit_price) * qty - cost
 
         conn.execute(
-            "UPDATE trades SET status='closed', actual_exit_price=?, pnl=? WHERE id=?",
-            (exit_price, round(pnl, 2), trade_id)
+            "UPDATE trades SET status='closed', actual_exit_price=?, pnl=?, exit_reason=? WHERE id=?",
+            (round(exit_price, 5), round(pnl, 2), exit_reason, trade_id)
         )
         conn.commit()
 
         color = "green" if pnl > 0 else "red"
         console.print(
-            f"\n  [{color}]<<< CLOSED {action} {sym} @ {exit_price:.4f} "
+            f"\n  [{color}]<<< CLOSED ({exit_reason}) {action} {sym} @ {exit_price:.4f} "
             f"| P&L: ${pnl:+,.2f} | Entry: {entry_price:.4f}[/{color}]"
         )
 
 
 def _display_dashboard(stats, models, iteration):
     """Display live dashboard."""
-    t = Table(title=f"ML Paper Trader — Update #{iteration}", show_header=True)
-    t.add_column("Metric", width=20)
-    t.add_column("Value", width=25)
+    t = Table(title=f"ML Paper Trader — Update #{iteration} (FunderPro Rules)", show_header=True)
+    t.add_column("Metric", width=22)
+    t.add_column("Value", width=30)
 
     balance = stats["balance"]
     pnl = stats["total_pnl"]
+    daily_pnl = stats["daily_pnl"]
     pc = "green" if pnl >= 0 else "red"
+    dc = "green" if daily_pnl >= 0 else "red"
 
     t.add_row("Balance", f"${balance:,.2f}")
-    t.add_row("P&L", f"[{pc}]${pnl:+,.2f}[/{pc}]")
+    t.add_row("Total P&L", f"[{pc}]${pnl:+,.2f} ({pnl/ACCOUNT_SIZE*100:+.2f}%)[/{pc}]")
+    t.add_row("Daily P&L", f"[{dc}]${daily_pnl:+,.2f}[/{dc}]")
     t.add_row("Total Trades", str(stats["total_trades"]))
-    t.add_row("Open Trades", str(stats["open_trades"]))
+    t.add_row("Open / Max", f"{stats['open_trades']} / {MAX_OPEN_TRADES}")
+    t.add_row("Today / Max", f"{stats['trades_today']} / {MAX_TRADES_PER_DAY}")
     t.add_row("Win Rate", f"{stats['win_rate']:.1f}%")
-    t.add_row("Models Loaded", ", ".join(models.keys()))
-    t.add_row("Next Check", f"{CHECK_INTERVAL//60} min")
+    dd_pct = abs(pnl) / ACCOUNT_SIZE * 100 if pnl < 0 else 0
+    dd_color = "red" if dd_pct > 5 else "yellow" if dd_pct > 3 else "green"
+    t.add_row("Drawdown", f"[{dd_color}]{dd_pct:.1f}% / {MAX_TOTAL_DD_PCT}% max[/{dd_color}]")
+    t.add_row("Models", ", ".join(models.keys()))
 
     console.print(t)
