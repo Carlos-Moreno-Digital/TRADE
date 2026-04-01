@@ -234,37 +234,59 @@ def _predict_now(model, scaler, df, sym) -> dict | None:
 
 
 def run_live_paper():
-    """Main loop: train models, predict, track trades."""
+    """Main loop: multi-agent pipeline with real-time prices."""
+    from trade.agents.multi.orchestrator import Orchestrator
+
     console.print(Panel.fit(
-        "[bold green]ML LIVE PAPER TRADER[/bold green]\n"
+        "[bold green]MULTI-AGENT ML TRADER[/bold green]\n"
         f"Symbols: {', '.join(SYMBOLS)}\n"
+        f"Pipeline: Alpha(XGBoost) → Risk Shield → Quant Tester → Compliance\n"
         f"Risk: {RISK_PER_TRADE*100:.2f}% per trade | SL: {SL_ATR_MULT}x ATR | TP: {TP_ATR_MULT}x ATR\n"
         f"Account: ${ACCOUNT_SIZE:,.0f} (paper) | Max {MAX_OPEN_TRADES} open | Max {MAX_TRADES_PER_DAY}/day\n"
         f"DD limits: {MAX_DAILY_LOSS_PCT}% daily / {MAX_TOTAL_DD_PCT}% total\n\n"
         "[dim]No broker needed — uses yfinance real-time prices[/dim]\n"
         "[dim]Ctrl+C to stop. All trades saved to data/ml_paper_trades.db[/dim]",
-        title="Live Paper Trading",
+        title="Multi-Agent Paper Trading",
         border_style="green",
     ))
 
     conn = _init_db()
-    models = {}
+    orchestrator = Orchestrator()
     last_train = {}
     last_candle = {}
 
     console.print("\n[bold]Training models on 2 years of 1H data...[/bold]")
+    all_data = {}
     for sym in SYMBOLS:
-        console.print(f"  Training {sym}...", end=" ")
-        model, scaler, df = _train_model(sym)
-        if model is not None:
-            models[sym] = (model, scaler, df)
-            last_train[sym] = datetime.now()
-            console.print("[green]OK[/green]")
-        else:
-            console.print("[red]FAILED[/red]")
+        console.print(f"  Downloading {sym}...", end=" ")
+        try:
+            df = yf.download(sym, period="2y", interval="1h", progress=False)
+            if not df.empty and len(df) > 500:
+                if hasattr(df.columns, 'levels'):
+                    df.columns = [c[0].lower() for c in df.columns]
+                else:
+                    df.columns = [c.lower() for c in df.columns]
+                all_data[sym] = df
+                console.print(f"[green]{len(df)} candles[/green]")
+            else:
+                console.print("[red]insufficient data[/red]")
+        except Exception:
+            console.print("[red]download error[/red]")
 
-    if not models:
-        console.print("[red]No models trained. Check internet connection.[/red]")
+    if not all_data:
+        console.print("[red]No data downloaded. Check internet connection.[/red]")
+        return
+
+    console.print("  Training XGBoost models...")
+    train_results = orchestrator.train_models(SYMBOLS, all_data)
+    for sym, ok in train_results.items():
+        status = "[green]OK[/green]" if ok else "[red]FAILED[/red]"
+        console.print(f"    {sym}: {status}")
+        if ok:
+            last_train[sym] = datetime.now()
+
+    if not any(train_results.values()):
+        console.print("[red]No models trained successfully.[/red]")
         return
 
     console.print(f"\n[bold green]Bot running. Checking for signals every {CHECK_INTERVAL//60} minutes.[/bold green]")
@@ -276,69 +298,60 @@ def run_live_paper():
             iteration += 1
             now = datetime.now()
 
-            # Check and close expired trades (horizon reached)
-            _check_exits(conn, models)
+            # Check and close expired trades (SL/TP/time)
+            _check_exits(conn, {})
 
             # Get account stats
             stats = _get_account_stats(conn)
 
             # Display dashboard
-            _display_dashboard(stats, models, iteration)
+            _display_dashboard(stats, orchestrator.alpha.models, iteration)
 
             # Retrain every 24 hours
             for sym in SYMBOLS:
                 if sym in last_train and (now - last_train[sym]).total_seconds() > 86400:
                     console.print(f"\n  [dim]Retraining {sym}...[/dim]", end=" ")
-                    model, scaler, df = _train_model(sym)
-                    if model is not None:
-                        models[sym] = (model, scaler, df)
-                        last_train[sym] = now
-                        console.print("[green]OK[/green]")
+                    try:
+                        df_retrain = yf.download(sym, period="2y", interval="1h", progress=False)
+                        if not df_retrain.empty:
+                            if hasattr(df_retrain.columns, 'levels'):
+                                df_retrain.columns = [c[0].lower() for c in df_retrain.columns]
+                            else:
+                                df_retrain.columns = [c.lower() for c in df_retrain.columns]
+                            if orchestrator.alpha.train(sym, df_retrain):
+                                last_train[sym] = now
+                                console.print("[green]OK[/green]")
+                            else:
+                                console.print("[red]FAILED[/red]")
+                    except Exception:
+                        console.print("[red]ERROR[/red]")
 
-            # === PROP FIRM RISK CHECKS ===
-            # Total drawdown kill switch
-            if stats["total_pnl"] < 0 and abs(stats["total_pnl"]) / ACCOUNT_SIZE * 100 >= MAX_TOTAL_DD_PCT:
-                console.print(f"  [red bold]KILL SWITCH: Total DD {abs(stats['total_pnl'])/ACCOUNT_SIZE*100:.1f}% >= {MAX_TOTAL_DD_PCT}%. NO TRADING.[/red bold]")
-                time.sleep(CHECK_INTERVAL)
-                continue
+            # === MULTI-AGENT PIPELINE ===
+            # All risk checks are now handled by Risk Shield + Compliance agents
+            account_state = {
+                "balance": stats["balance"],
+                "daily_pnl": stats["daily_pnl"],
+                "total_pnl": stats["total_pnl"],
+                "open_trades": stats["open_trades"],
+                "trades_today": stats["trades_today"],
+                "consec_losses": stats["consec_losses"],
+                "open_positions": [],
+                "last_loss_time": None,
+                "recent_trades": [],
+            }
 
-            # Daily loss limit
-            if stats["daily_pnl"] < 0 and abs(stats["daily_pnl"]) / ACCOUNT_SIZE * 100 >= MAX_DAILY_LOSS_PCT:
-                console.print(f"  [red]Daily loss limit hit ({abs(stats['daily_pnl'])/ACCOUNT_SIZE*100:.1f}%). Waiting for tomorrow.[/red]")
-                time.sleep(CHECK_INTERVAL)
-                continue
+            # Get last loss time for cooldown
+            cur_lt = conn.execute("SELECT timestamp FROM trades WHERE status='closed' AND pnl < 0 ORDER BY id DESC LIMIT 1")
+            lt_row = cur_lt.fetchone()
+            if lt_row:
+                account_state["last_loss_time"] = lt_row[0]
 
-            # Weekend check (no holding over weekend — close Friday 20:00 UTC)
-            if now.weekday() == 4 and now.hour >= 20:
-                console.print("  [yellow]Friday close — no new trades. Weekend rule.[/yellow]")
-                time.sleep(CHECK_INTERVAL)
-                continue
+            # Get recent trades for martingale detection
+            cur_rt = conn.execute("SELECT quantity, pnl FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 3")
+            account_state["recent_trades"] = [{"quantity": r[0], "pnl": r[1]} for r in cur_rt.fetchall()]
 
-            # Consecutive losses cooldown
-            if stats["consec_losses"]:
-                cur_cool = conn.execute("SELECT timestamp FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 1")
-                last_loss_row = cur_cool.fetchone()
-                if last_loss_row:
-                    last_loss_time = datetime.fromisoformat(last_loss_row[0])
-                    cooldown_left = CONSEC_LOSS_COOLDOWN - (now - last_loss_time).total_seconds()
-                    if cooldown_left > 0:
-                        console.print(f"  [yellow]Cooldown: {int(cooldown_left/60)}min left after 2 consecutive losses[/yellow]")
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-
-            # Check for new signals
             for sym in SYMBOLS:
-                if sym not in models:
-                    continue
-
-                # Max open trades check
-                if stats["open_trades"] >= MAX_OPEN_TRADES:
-                    break
-
-                # Max daily trades check
-                if stats["trades_today"] >= MAX_TRADES_PER_DAY:
-                    break
-
+                # Download latest data
                 try:
                     df_latest = yf.download(sym, period="1mo", interval="1h", progress=False)
                     if df_latest.empty:
@@ -350,7 +363,7 @@ def run_live_paper():
                 except Exception:
                     continue
 
-                # Check if we have a new candle
+                # Check for new candle
                 latest_ts = str(df_latest.index[-1])
                 if latest_ts == last_candle.get(sym):
                     continue
@@ -361,75 +374,54 @@ def run_live_paper():
                 if cur.fetchone()[0] > 0:
                     continue
 
-                model, scaler, df_hist = models[sym]
-                df_combined = df_latest
-                if len(df_combined) < 50:
+                if len(df_latest) < 50:
                     continue
 
-                signal = _predict_now(model, scaler, df_combined, sym)
-                if signal is None:
-                    try:
-                        feat = _build_features(df_combined)
-                        d = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
-                        X = scaler.transform(d.iloc[[-1]])
-                        proba = model.predict_proba(X)[0]
-                        y_inv = {0: "SHORT", 1: "NEUTRAL", 2: "LONG"}
-                        best = int(proba.argmax())
+                # === RUN FULL PIPELINE: Alpha → Risk → Quant → Compliance ===
+                decision = orchestrator.evaluate(sym, df_latest, account_state)
+
+                if decision.status_flag == "APPROVED":
+                    # TRADE APPROVED BY ALL 4 AGENTS
+                    p = decision.computational_payload
+                    horizon_end = (now + timedelta(hours=HORIZON)).isoformat()
+
+                    conn.execute(
+                        "INSERT INTO trades (timestamp, symbol, action, entry_price, "
+                        "stop_loss, take_profit, quantity, confidence, status, "
+                        "horizon_end, spread_cost, notes) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
+                        (now.isoformat(), sym, p["action"], p["entry_price"],
+                         p.get("sl_price", 0), p.get("tp_price", 0),
+                         p.get("quantity", 0), p.get("confidence", 0),
+                         horizon_end, p.get("spread_cost", 0),
+                         f"R:R={p.get('rr_ratio', 0):.2f} | {decision.economic_rationale[:100]}")
+                    )
+                    conn.commit()
+
+                    # Update account state for next symbol
+                    account_state["open_trades"] += 1
+                    account_state["trades_today"] += 1
+
+                    ac = "green" if p["action"] == "BUY" else "red"
+                    console.print(
+                        f"\n  [{ac}]>>> {p['action']} {sym} @ {p['entry_price']:.4f} "
+                        f"| SL: {p.get('sl_price', 0):.4f} | TP: {p.get('tp_price', 0):.4f} "
+                        f"| Conf: {p.get('confidence', 0):.1%} | Qty: {p.get('quantity', 0):.2f}[/{ac}]"
+                    )
+                    console.print(f"  [dim]  Pipeline: {decision.economic_rationale[:120]}[/dim]")
+
+                elif decision.status_flag == "NO_SIGNAL":
+                    # Show diagnostic
+                    diag = orchestrator.get_diagnostic(sym, df_latest)
+                    console.print(f"  [dim]{diag}[/dim]")
+
+                elif decision.is_rejected():
+                    # Show why rejected (only if it was a real signal that got blocked)
+                    if decision.agent_domain != "alpha_generator":
                         console.print(
-                            f"  [dim]{sym}: {y_inv[best]} ({proba[best]:.1%}) | "
-                            f"S:{proba[0]:.1%} N:{proba[1]:.1%} L:{proba[2]:.1%}[/dim]"
+                            f"  [yellow]{sym}: BLOCKED by {decision.agent_domain} — "
+                            f"{decision.errors[0] if decision.errors else decision.economic_rationale[:80]}[/yellow]"
                         )
-                    except Exception:
-                        pass
-                    continue
-
-                # === POSITION SIZING WITH SL/TP (PROP FIRM COMPLIANT) ===
-                price = signal["price"]
-                atr = signal["atr"]
-                spread = SPREADS.get(sym, 0.0002)
-                slip = spread * SLIPPAGE
-
-                # SL/TP based on ATR
-                sl_dist = atr * SL_ATR_MULT
-                tp_dist = atr * TP_ATR_MULT
-
-                if signal["action"] == "BUY":
-                    sl_price = price - sl_dist
-                    tp_price = price + tp_dist
-                else:
-                    sl_price = price + sl_dist
-                    tp_price = price - tp_dist
-
-                # Position sizing: risk 0.75% of account
-                risk_amt = stats["balance"] * RISK_PER_TRADE
-                qty = risk_amt / sl_dist if sl_dist > 0 else 0
-                max_qty = stats["balance"] * 5 / price if price > 0 else 0
-                qty = min(qty, max_qty)
-                cost = (spread + slip * 2) * qty
-
-                if qty <= 0:
-                    continue
-
-                horizon_end = (now + timedelta(hours=HORIZON)).isoformat()
-
-                conn.execute(
-                    "INSERT INTO trades (timestamp, symbol, action, entry_price, "
-                    "stop_loss, take_profit, quantity, confidence, status, "
-                    "horizon_end, spread_cost, notes) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
-                    (now.isoformat(), sym, signal["action"], price,
-                     round(sl_price, 5), round(tp_price, 5),
-                     round(qty, 4), signal["confidence"], horizon_end, round(cost, 2),
-                     f"atr={atr:.5f}, R:R={tp_dist/sl_dist:.2f}")
-                )
-                conn.commit()
-
-                action_color = "green" if signal["action"] == "BUY" else "red"
-                console.print(
-                    f"\n  [{action_color}]>>> {signal['action']} {sym} @ {price:.4f} "
-                    f"| SL: {sl_price:.4f} | TP: {tp_price:.4f} "
-                    f"| Conf: {signal['confidence']:.1%} | Qty: {qty:.2f}[/{action_color}]"
-                )
 
             time.sleep(CHECK_INTERVAL)
 
