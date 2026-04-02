@@ -170,6 +170,31 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_long = ret_s.rolling(168).std()
     feat["vol_regime_ratio"] = vol_short / (vol_long + 1e-10)
 
+    # IBS — Internal Bar Strength (Paper Sec 4.4, Eq. 370)
+    # Mean reversion signal: IBS near 0 = oversold, near 1 = overbought
+    ibs = (close - low) / (high - low + 1e-10)
+    feat["ibs"] = ibs
+    feat["ibs_sma_5"] = pd.Series(ibs, index=df.index).rolling(5).mean()
+
+    # PIVOT POINT DISTANCE (Paper Sec 3.14, Eqs. 325-328)
+    # Institutional S/R levels, distance from price = mean reversion signal
+    prev_h = pd.Series(high, index=df.index).shift(1)
+    prev_l = pd.Series(low, index=df.index).shift(1)
+    prev_c = pd.Series(close, index=df.index).shift(1)
+    pivot = (prev_h + prev_l + prev_c) / 3
+    resistance = 2 * pivot - prev_l
+    support = 2 * pivot - prev_h
+    feat["pivot_dist"] = (close - pivot) / (pivot + 1e-10)
+    feat["resistance_dist"] = (resistance - close) / (close + 1e-10)
+    feat["support_dist"] = (close - support) / (close + 1e-10)
+
+    # TANH-SMOOTHED MOMENTUM (Paper Sec 10.4, Eq. 474-480)
+    # Smoother than sign(return), avoids whipsaws
+    for period in [12, 24, 48]:
+        ret_p = pd.Series(close, index=df.index).pct_change(period)
+        kappa_cs = ret_p.rolling(100).std()
+        feat[f"tanh_mom_{period}"] = np.tanh(ret_p / (kappa_cs + 1e-10))
+
     return feat
 
 
