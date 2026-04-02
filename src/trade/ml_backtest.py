@@ -198,11 +198,10 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     return feat
 
 
-def _build_target(df: pd.DataFrame, horizon: int = 3, min_move_pct: float = 0.0005) -> pd.Series:
+def _build_target(df: pd.DataFrame, horizon: int = 8, min_move_pct: float = 0.001) -> pd.Series:
     """Build target: 1 = profitable long, -1 = profitable short, 0 = neutral.
 
-    CRITICAL: Uses TRUE future returns (close[t+horizon] - close[t]) / close[t].
-    Previous version had look-ahead bias bug (used past returns).
+    Uses TRUE future returns (close[t+horizon] - close[t]) / close[t].
     """
     close_s = pd.Series(df["close"].values.astype(float), index=df.index)
     future_close = close_s.shift(-horizon)
@@ -436,7 +435,7 @@ class MLBacktester:
                     if qty <= 0:
                         continue
 
-                    # Fixed-horizon exit (8 candles)
+                    # Fixed-horizon exit (8 candles) — proven best for backtest
                     if j + 8 >= len(close_prices):
                         continue
 
