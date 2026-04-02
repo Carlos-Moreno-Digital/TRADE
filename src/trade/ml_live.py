@@ -46,21 +46,35 @@ EXTRA_SPREADS = {
 SPREADS.update(EXTRA_SPREADS)
 
 DB_PATH = Path("data/ml_paper_trades.db")
-SYMBOLS = ["GBPNZD=X", "GC=F", "AUDNZD=X", "GBPCHF=X", "USDCAD=X", "USDCHF=X"]
-ACCOUNT_SIZE = 10000.0
+SYMBOLS = ["USDJPY=X", "GC=F", "GBPNZD=X", "EURUSD=X", "AUDNZD=X"]
+# === ACCOUNT CONFIG (change for different prop firm tiers) ===
+import os
+_TIER = os.environ.get("PROP_TIER", "10K")  # "10K" or "250K"
 
-# === FUNDERPRO PROP FIRM RULES ===
-RISK_PER_TRADE = 0.0075  # 0.75% max (firm rule)
+if _TIER == "250K":
+    ACCOUNT_SIZE = 250000.0
+    RISK_PER_TRADE = 0.003   # 0.3% = $750/trade (conservative for 250K)
+    MAX_OPEN_TRADES = 4      # More capital = more concurrent positions
+    MAX_TRADES_PER_DAY = 8   # More instruments = more opportunities
+    MAX_DAILY_LOSS_PCT = 2.5 # Tighter daily limit for larger account
+    MAX_TOTAL_DD_PCT = 6.0   # Tighter total DD for larger account
+    RETRAIN_INTERVAL = 21600 # Retrain every 6 hours (not 24h)
+else:
+    ACCOUNT_SIZE = 10000.0
+    RISK_PER_TRADE = 0.0075  # 0.75% = $75/trade
+    MAX_OPEN_TRADES = 2
+    MAX_TRADES_PER_DAY = 4
+    MAX_DAILY_LOSS_PCT = 3.0
+    MAX_TOTAL_DD_PCT = 7.0
+    RETRAIN_INTERVAL = 86400 # Retrain every 24 hours
+
+# === SHARED RULES ===
 CONFIDENCE_THRESHOLD = 0.53
 HORIZON = 8  # 8-hour prediction horizon
 CHECK_INTERVAL = 300  # Check every 5 minutes
-MAX_OPEN_TRADES = 2  # FunderPro: max 2 concurrent
-MAX_TRADES_PER_DAY = 4  # FunderPro: max 4/day
-MAX_DAILY_LOSS_PCT = 3.0  # Hard stop 3% (firm: 5%, safety: 4%)
-MAX_TOTAL_DD_PCT = 7.0  # Hard stop 7% (firm: 10%, safety: 8%)
 CONSEC_LOSS_COOLDOWN = 3600  # 60 min cooldown after 2 consecutive losses
 SL_ATR_MULT = 1.5  # Stop loss at 1.5x ATR
-TP_ATR_MULT = 2.5  # Take profit at 2.5x ATR → R:R = 1.67 (min 1.5)
+TP_ATR_MULT = 2.5  # Take profit at 2.5x ATR → R:R = 1.67
 
 
 def _init_db():
@@ -309,7 +323,7 @@ def run_live_paper():
 
             # Retrain every 24 hours
             for sym in SYMBOLS:
-                if sym in last_train and (now - last_train[sym]).total_seconds() > 86400:
+                if sym in last_train and (now - last_train[sym]).total_seconds() > RETRAIN_INTERVAL:
                     console.print(f"\n  [dim]Retraining {sym}...[/dim]", end=" ")
                     try:
                         df_retrain = yf.download(sym, period="2y", interval="1h", progress=False)

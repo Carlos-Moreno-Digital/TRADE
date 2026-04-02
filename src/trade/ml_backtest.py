@@ -318,7 +318,8 @@ class MLBacktester:
         # Symbols with PROVEN edge (tested 29 instruments, these 6 profitable):
         # Massive scan results: GBPNZD +$3,098, GC=F +$3,058, AUDNZD +$2,927
         # GBPCHF +$780, USDCAD +$577, USDCHF +$441
-        ml_symbols = ["GBPNZD=X", "GC=F", "AUDNZD=X", "GBPCHF=X", "USDCAD=X", "USDCHF=X"]
+        # Top 5 from 44-instrument scan (only instruments with proven edge)
+        ml_symbols = ["USDJPY=X", "GC=F", "GBPNZD=X", "EURUSD=X", "AUDNZD=X"]
 
         for sym in ml_symbols:
             df = all_data.get(sym)
