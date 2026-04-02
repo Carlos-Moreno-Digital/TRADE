@@ -158,6 +158,18 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
         feat[f"returns_lag_{lag}"] = feat["returns_1"].shift(lag)
         feat[f"rsi_lag_{lag}"] = feat["rsi_14"].shift(lag)
 
+    # ====================================================================
+    # PAPER-DERIVED FEATURES (Kakushadze & Serur, "151 Trading Strategies")
+    # All features CAUSAL. HP filter and OU process removed (leakage risk).
+    # Only features that INDIVIDUALLY tested positive are included.
+    # ====================================================================
+
+    # VOLATILITY REGIME RATIO (Paper Sec 6.5) — simple, causal, useful
+    ret_s = pd.Series(close, index=df.index).pct_change(1)
+    vol_short = ret_s.rolling(24).std()
+    vol_long = ret_s.rolling(168).std()
+    feat["vol_regime_ratio"] = vol_short / (vol_long + 1e-10)
+
     return feat
 
 
@@ -168,7 +180,6 @@ def _build_target(df: pd.DataFrame, horizon: int = 3, min_move_pct: float = 0.00
     Previous version had look-ahead bias bug (used past returns).
     """
     close_s = pd.Series(df["close"].values.astype(float), index=df.index)
-    # TRUE future return: (price at t+horizon - price at t) / price at t
     future_close = close_s.shift(-horizon)
     future_return = (future_close - close_s) / close_s
 
@@ -176,6 +187,33 @@ def _build_target(df: pd.DataFrame, horizon: int = 3, min_move_pct: float = 0.00
     target[future_return > min_move_pct] = 1   # Long signal
     target[future_return < -min_move_pct] = -1  # Short signal
     return target
+
+
+def _build_target_quantile(df: pd.DataFrame, horizon: int = 8, K: int = 5) -> pd.Series:
+    """Quantile-based target (Paper Sec 18.2, Eqs. 530-537).
+
+    Instead of binary up/down, predict which QUANTILE the return falls into.
+    Class 0 = strongest down, Class K-1 = strongest up.
+    Only trade when model predicts extreme quantiles (0 or K-1).
+    """
+    close_s = pd.Series(df["close"].values.astype(float), index=df.index)
+    future_close = close_s.shift(-horizon)
+    future_return = (future_close - close_s) / close_s
+
+    # Use rolling quantiles to avoid look-ahead bias
+    target = pd.Series(np.nan, index=df.index)
+    lookback = 2000  # Use last 2000 returns to compute quantile boundaries
+
+    for i in range(lookback, len(future_return)):
+        if np.isnan(future_return.iloc[i]):
+            continue
+        historical = future_return.iloc[max(0, i-lookback):i].dropna()
+        if len(historical) < 100:
+            continue
+        boundaries = np.quantile(historical, np.linspace(0, 1, K + 1)[1:-1])
+        target.iloc[i] = np.digitize(future_return.iloc[i], boundaries)
+
+    return target.fillna(K // 2)  # Default to middle quantile
 
 
 class MLBacktester:

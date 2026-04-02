@@ -134,9 +134,16 @@ class RiskShield:
                 errors=[f"R:R ratio {rr:.2f} < 1.5 minimum"],
             )
 
-        # Risk amount: scale between 0.5% and 0.75% based on confidence
-        risk_pct = MIN_RISK_PER_TRADE_PCT + (confidence - 0.53) * (MAX_RISK_PER_TRADE_PCT - MIN_RISK_PER_TRADE_PCT) / 0.47
-        risk_pct = max(MIN_RISK_PER_TRADE_PCT, min(MAX_RISK_PER_TRADE_PCT, risk_pct))
+        # KELLY CRITERION position sizing (Paper Sec 17.1)
+        # f* = (p * b - q) / b, then use fractional Kelly (25%)
+        win_prob = confidence
+        loss_prob = 1 - win_prob
+        b = rr  # Win/loss ratio = R:R
+        kelly_f = (win_prob * b - loss_prob) / b if b > 0 else 0
+        fractional_kelly = max(0, kelly_f * 0.25)  # 25% Kelly for safety
+
+        # Clamp between min and max risk per trade
+        risk_pct = max(MIN_RISK_PER_TRADE_PCT, min(MAX_RISK_PER_TRADE_PCT, fractional_kelly * 100))
         risk_amt = balance * risk_pct / 100
 
         # Lot sizing
