@@ -437,12 +437,11 @@ def run_live_paper():
             break
 
 
-def _check_exits(conn, models):
-    """Check open trades for SL/TP hits and time exits."""
+def _check_exits(conn, _unused):
+    """Check open trades for SL/TP/trailing stop hits and time exits."""
     now_str = datetime.now().isoformat()
     now = datetime.now()
 
-    # Get ALL open trades
     cur = conn.execute(
         "SELECT id, symbol, action, entry_price, stop_loss, take_profit, "
         "quantity, spread_cost, horizon_end FROM trades WHERE status='open'"
@@ -451,7 +450,6 @@ def _check_exits(conn, models):
     for row in cur.fetchall():
         trade_id, sym, action, entry_price, sl, tp, qty, cost, horizon_end = row
 
-        # Get current price
         try:
             df = yf.download(sym, period="1d", interval="1h", progress=False)
             if df.empty:
@@ -470,15 +468,47 @@ def _check_exits(conn, models):
 
         exit_price = None
         exit_reason = None
+        sl_dist = abs(entry_price - sl) if sl and sl > 0 else 0
+
+        # === TRAILING STOP (Chandelier Exit) ===
+        # Move SL to breakeven after 1R profit, then trail at 1R behind
+        if sl and sl > 0 and sl_dist > 0:
+            if action == "BUY":
+                profit_pips = current_close - entry_price
+                if profit_pips >= sl_dist * 1.5:
+                    # Trail at 1R behind current price
+                    new_sl = current_close - sl_dist
+                    if new_sl > sl:
+                        conn.execute("UPDATE trades SET stop_loss=? WHERE id=?", (round(new_sl, 5), trade_id))
+                        sl = new_sl
+                elif profit_pips >= sl_dist:
+                    # Move to breakeven + small buffer
+                    new_sl = entry_price + sl_dist * 0.1
+                    if new_sl > sl:
+                        conn.execute("UPDATE trades SET stop_loss=? WHERE id=?", (round(new_sl, 5), trade_id))
+                        sl = new_sl
+            else:  # SELL
+                profit_pips = entry_price - current_close
+                if profit_pips >= sl_dist * 1.5:
+                    new_sl = current_close + sl_dist
+                    if new_sl < sl:
+                        conn.execute("UPDATE trades SET stop_loss=? WHERE id=?", (round(new_sl, 5), trade_id))
+                        sl = new_sl
+                elif profit_pips >= sl_dist:
+                    new_sl = entry_price - sl_dist * 0.1
+                    if new_sl < sl:
+                        conn.execute("UPDATE trades SET stop_loss=? WHERE id=?", (round(new_sl, 5), trade_id))
+                        sl = new_sl
 
         # Check SL hit
         if sl and sl > 0:
             if action == "BUY" and current_low <= sl:
                 exit_price = sl
-                exit_reason = "SL"
+                # If SL was trailed above entry, it's a win
+                exit_reason = "TRAIL" if sl > entry_price else "SL"
             elif action == "SELL" and current_high >= sl:
                 exit_price = sl
-                exit_reason = "SL"
+                exit_reason = "TRAIL" if sl < entry_price else "SL"
 
         # Check TP hit
         if tp and tp > 0 and exit_price is None:

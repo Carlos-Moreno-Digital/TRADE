@@ -156,7 +156,14 @@ class AlphaGenerator:
         regime = self.detect_regime(df)
 
         # No signal if neutral or low confidence
-        if pred_class == 0 or max_prob < self.confidence_threshold:
+        # ADAPTIVE: lower threshold in strong trending regimes
+        threshold = self.confidence_threshold
+        if regime in ("TRENDING", "TRENDING_VOLATILE"):
+            threshold = 0.48  # More aggressive in trends (edge is stronger)
+        elif regime == "RANGING":
+            threshold = 0.55  # More conservative in ranges (edge is weaker)
+
+        if pred_class == 0 or max_prob < threshold:
             return AgentMessage(
                 agent_domain="alpha_generator",
                 status_flag="NO_SIGNAL",
