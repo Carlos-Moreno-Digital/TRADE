@@ -210,10 +210,16 @@ class AlphaGenerator:
         elif regime == "RANGING":
             threshold = 0.55  # More conservative in ranges (edge is weaker)
 
-        # Per-symbol adjustment based on live performance
-        # GC=F (Gold) has 1/5 WR in live trading — require higher confidence
-        if sym in ("GC=F",):
-            threshold = max(threshold, 0.58)  # Gold needs 58%+ confidence
+        # Per-symbol optimal confidence (from empirical sweep)
+        sym_thresholds = {
+            "USDJPY=X": 0.53,  # +$10,652 at 0.53
+            "GC=F": 0.55,      # +$8,401 at 0.55 (was 0.58, too strict)
+            "GBPNZD=X": 0.58,  # +$3,985 at 0.58
+            "EURUSD=X": 0.53,  # +$4,554 at 0.53
+            "AUDNZD=X": 0.55,  # +$1,126 at 0.55
+        }
+        if sym in sym_thresholds:
+            threshold = max(threshold, sym_thresholds[sym])
 
         if pred_class == 0 or max_prob < threshold:
             return AgentMessage(
