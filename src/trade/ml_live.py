@@ -360,9 +360,9 @@ def run_live_paper():
             if lt_row:
                 account_state["last_loss_time"] = lt_row[0]
 
-            # Get recent trades for martingale detection
-            cur_rt = conn.execute("SELECT quantity, pnl FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 3")
-            account_state["recent_trades"] = [{"quantity": r[0], "pnl": r[1]} for r in cur_rt.fetchall()]
+            # Get recent trades for martingale detection + StoplossGuard
+            cur_rt = conn.execute("SELECT quantity, pnl, symbol, exit_reason FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 5")
+            account_state["recent_trades"] = [{"quantity": r[0], "pnl": r[1], "symbol": r[2], "exit_reason": r[3]} for r in cur_rt.fetchall()]
 
             for sym in SYMBOLS:
                 # Download latest data

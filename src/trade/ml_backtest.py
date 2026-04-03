@@ -482,17 +482,27 @@ class MLBacktester:
         pf = abs(sum(t["pnl"] for t in all_trades if t["pnl"] > 0) /
                  sum(t["pnl"] for t in all_trades if t["pnl"] <= 0)) if any(t["pnl"] <= 0 for t in all_trades) else 999
 
+        # Advanced metrics (from Freqtrade/Backtesting.py analysis)
+        trade_pnls = np.array([t["pnl"] for t in all_trades]) if all_trades else np.array([0])
+        sqn = float(np.sqrt(len(trade_pnls)) * np.mean(trade_pnls) / (np.std(trade_pnls) + 1e-10)) if len(trade_pnls) > 1 else 0
+        ann_return = total_pnl / self.account_size * 100 / 2  # 2 years → annualized
+        calmar = ann_return / max_dd if max_dd > 0 else 0
+        expectancy = (wr/100 * avg_win) + ((100-wr)/100 * avg_loss) if total_trades > 0 else 0
+
         console.print(f"\n  [bold]ML Ensemble Results:[/bold]")
         pc = "green" if total_pnl >= 0 else "red"
         console.print(f"  P&L: [{pc}]${total_pnl:+,.2f} ({total_pnl/self.account_size*100:+.1f}%)[/{pc}]")
         console.print(f"  Trades: {total_trades} | WR: {wr:.1f}% | PF: {pf:.2f} | Max DD: {max_dd:.1f}%")
         console.print(f"  Avg Win: ${avg_win:+,.2f} | Avg Loss: ${avg_loss:+,.2f}")
+        console.print(f"  SQN: {sqn:.2f} | Calmar: {calmar:.2f} | Expectancy: ${expectancy:+,.2f}/trade")
 
         return {
             "pnl": total_pnl, "trades": total_trades, "wins": total_wins,
             "win_rate": round(wr, 1), "max_dd": round(max_dd, 1),
             "profit_factor": round(pf, 2),
             "avg_win": round(avg_win, 2), "avg_loss": round(avg_loss, 2),
+            "sqn": round(sqn, 2), "calmar": round(calmar, 2),
+            "expectancy": round(expectancy, 2),
             "all_trades": all_trades,
         }
 

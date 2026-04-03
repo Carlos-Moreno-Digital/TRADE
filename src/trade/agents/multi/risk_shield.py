@@ -51,6 +51,19 @@ class RiskShield:
         daily_pnl = account_state.get("daily_pnl", 0)
         total_pnl = account_state.get("total_pnl", 0)
 
+        # === PER-SYMBOL STOPLOSS GUARD ===
+        # If a symbol has hit SL 3+ times in recent trades, lock it temporarily
+        sym = payload.get("symbol", "")
+        recent = account_state.get("recent_trades", [])
+        sym_recent_sl = sum(1 for t in recent if t.get("symbol") == sym and t.get("exit_reason") == "SL")
+        if sym_recent_sl >= 3:
+            return AgentMessage(
+                agent_domain="risk_shield",
+                status_flag="BLOCKED",
+                errors=[f"StoplossGuard: {sym} hit SL {sym_recent_sl} times recently. Cooling down."],
+                economic_rationale=f"Symbol {sym} is in a losing streak — blocked until pattern changes",
+            )
+
         # === KILL SWITCH: Daily loss ===
         if daily_pnl < 0 and abs(daily_pnl) / ACCOUNT_SIZE * 100 >= KILL_SWITCH_DAILY_PCT:
             return AgentMessage(
