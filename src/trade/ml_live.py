@@ -397,7 +397,9 @@ def run_live_paper():
                 if decision.status_flag == "APPROVED":
                     # TRADE APPROVED BY ALL 4 AGENTS
                     p = decision.computational_payload
-                    horizon_end = (now + timedelta(hours=HORIZON)).isoformat()
+                    # Use per-symbol horizon from orchestrator
+                    sym_horizon = p.get("horizon_hours", HORIZON)
+                    horizon_end = (now + timedelta(hours=sym_horizon)).isoformat()
 
                     conn.execute(
                         "INSERT INTO trades (timestamp, symbol, action, entry_price, "

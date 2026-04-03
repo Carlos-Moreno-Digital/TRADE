@@ -41,15 +41,25 @@ class AlphaGenerator:
         self.models: dict[str, tuple] = {}  # sym -> (model, scaler, meta_model)
         self.train_bars = 4000
         self.purge_bars = 24
-        self.horizon = 8
         self.min_move = 0.001
         self.confidence_threshold = 0.53
-        self.xgb_params = None  # Will be set by Optuna if available
+        self.xgb_params = None
+
+        # Per-instrument optimal horizon (from empirical sweep)
+        self.horizons = {
+            "USDJPY=X": 10,   # +$10,652 at H=10 vs +$1,104 at H=8
+            "GC=F": 8,        # +$8,053 (already optimal)
+            "GBPNZD=X": 10,   # +$3,684 at H=10 vs +$2,740 at H=8
+            "EURUSD=X": 6,    # +$4,554 at H=6 vs -$83 at H=8
+            "AUDNZD=X": 4,    # +$964 at H=4 vs -$885 at H=8
+        }
+        self.default_horizon = 8
 
     def train(self, sym: str, df: pd.DataFrame) -> bool:
-        """Train XGBoost model for a symbol."""
+        """Train XGBoost model for a symbol with per-instrument optimal horizon."""
+        horizon = self.horizons.get(sym, self.default_horizon)
         features = _build_features(df)
-        target = _build_target(df, horizon=self.horizon, min_move_pct=self.min_move)
+        target = _build_target(df, horizon=horizon, min_move_pct=self.min_move)
 
         data = features.copy()
         data["target"] = target
@@ -259,7 +269,7 @@ class AlphaGenerator:
                 "regime": regime,
                 "atr": atr_val,
                 "probabilities": {"short": float(proba[0]), "neutral": float(proba[1]), "long": float(proba[2])},
-                "horizon_hours": self.horizon,
+                "horizon_hours": self.horizons.get(sym, self.default_horizon),
             },
             economic_rationale=f"XGBoost predicts {action} with {max_prob:.1%} confidence in {regime} regime",
         )
