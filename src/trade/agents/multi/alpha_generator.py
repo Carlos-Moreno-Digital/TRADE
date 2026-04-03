@@ -47,13 +47,22 @@ class AlphaGenerator:
 
         # Per-instrument optimal horizon (from empirical sweep)
         self.horizons = {
-            "USDJPY=X": 10,   # +$10,652 at H=10 vs +$1,104 at H=8
-            "GC=F": 8,        # +$8,053 (already optimal)
-            "GBPNZD=X": 10,   # +$3,684 at H=10 vs +$2,740 at H=8
-            "EURUSD=X": 6,    # +$4,554 at H=6 vs -$83 at H=8
-            "AUDNZD=X": 4,    # +$964 at H=4 vs -$885 at H=8
+            "USDJPY=X": 10,
+            "GC=F": 8,
+            "GBPNZD=X": 10,
+            "EURUSD=X": 6,
+            "AUDNZD=X": 4,
         }
         self.default_horizon = 8
+
+        # Hours to AVOID per instrument (empirically lose money)
+        self.avoid_hours = {
+            "USDJPY=X": {6, 11, 12, 13, 20},       # -$5,269 in these hours
+            "GC=F": {2, 3, 4, 17, 18, 19, 22},      # -$6,986 in these hours
+            "GBPNZD=X": {0, 2, 6, 8, 10, 16, 18},   # -$2,905 in these hours
+            "EURUSD=X": {7, 8, 9, 12},               # -$2,022 in these hours
+            "AUDNZD=X": set(),                        # Too few trades to filter
+        }
 
     def train(self, sym: str, df: pd.DataFrame) -> bool:
         """Train XGBoost model for a symbol with per-instrument optimal horizon."""
@@ -170,6 +179,18 @@ class AlphaGenerator:
                 status_flag="REJECTED",
                 economic_rationale=f"No trained model for {sym}",
             )
+
+        # SESSION FILTER: skip hours that empirically lose money
+        if hasattr(df.index, 'hour') and len(df) > 0:
+            current_hour = df.index[-1].hour
+            avoid = self.avoid_hours.get(sym, set())
+            if current_hour in avoid:
+                return AgentMessage(
+                    agent_domain="alpha_generator",
+                    status_flag="NO_SIGNAL",
+                    computational_payload={"symbol": sym, "blocked_hour": current_hour},
+                    economic_rationale=f"Hour {current_hour}:00 UTC historically unprofitable for {sym}",
+                )
 
         model, scaler, meta_model = self.models[sym]
         features = _build_features(df)
