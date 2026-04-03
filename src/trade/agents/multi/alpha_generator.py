@@ -200,6 +200,11 @@ class AlphaGenerator:
         elif regime == "RANGING":
             threshold = 0.55  # More conservative in ranges (edge is weaker)
 
+        # Per-symbol adjustment based on live performance
+        # GC=F (Gold) has 1/5 WR in live trading — require higher confidence
+        if sym in ("GC=F",):
+            threshold = max(threshold, 0.58)  # Gold needs 58%+ confidence
+
         if pred_class == 0 or max_prob < threshold:
             return AgentMessage(
                 agent_domain="alpha_generator",
