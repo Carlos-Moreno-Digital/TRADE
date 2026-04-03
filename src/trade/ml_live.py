@@ -46,6 +46,7 @@ EXTRA_SPREADS = {
 SPREADS.update(EXTRA_SPREADS)
 
 DB_PATH = Path("data/ml_paper_trades.db")
+THOUGHT_LOG = Path("data/bot_thoughts.log")
 SYMBOLS = ["USDJPY=X", "GC=F", "GBPNZD=X", "EURUSD=X", "AUDNZD=X"]
 # === ACCOUNT CONFIG (change for different prop firm tiers) ===
 import os
@@ -75,6 +76,18 @@ CHECK_INTERVAL = 300  # Check every 5 minutes
 CONSEC_LOSS_COOLDOWN = 3600  # 60 min cooldown after 2 consecutive losses
 SL_ATR_MULT = 1.5  # Stop loss at 1.5x ATR
 TP_ATR_MULT = 2.5  # Take profit at 2.5x ATR → R:R = 1.67
+
+
+def _log_thought(category: str, symbol: str, message: str, data: dict = None):
+    """Log bot's reasoning to thought log for auditing."""
+    THOUGHT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] [{category:12s}] {symbol:12s} | {message}"
+    if data:
+        details = " | ".join(f"{k}={v}" for k, v in data.items())
+        entry += f" | {details}"
+    with open(THOUGHT_LOG, "a") as f:
+        f.write(entry + "\n")
 
 
 def _init_db():
@@ -392,14 +405,31 @@ def run_live_paper():
                     continue
 
                 # === RUN FULL PIPELINE: Alpha → Risk → Quant → Compliance ===
+                _log_thought("EVALUATE", sym, f"New candle {latest_ts}, running pipeline")
                 decision = orchestrator.evaluate(sym, df_latest, account_state)
 
+                # Log the full pipeline reasoning
+                for phase in orchestrator.pipeline_log[-1:]:
+                    for p_entry in phase.get("phases", []):
+                        _log_thought(
+                            p_entry["agent"].upper()[:12],
+                            sym,
+                            f"{p_entry['status']}: {p_entry.get('rationale', '')[:200]}",
+                            {"errors": p_entry.get("errors", [])} if p_entry.get("errors") else None,
+                        )
+                    _log_thought("DECISION", sym, f"Final: {phase.get('final', 'unknown')}")
+
                 if decision.status_flag == "APPROVED":
-                    # TRADE APPROVED BY ALL 4 AGENTS
                     p = decision.computational_payload
-                    # Use per-symbol horizon from orchestrator
                     sym_horizon = p.get("horizon_hours", HORIZON)
                     horizon_end = (now + timedelta(hours=sym_horizon)).isoformat()
+
+                    _log_thought("EXECUTE", sym, f"{p['action']} @ {p['entry_price']:.4f}", {
+                        "SL": p.get("sl_price", 0), "TP": p.get("tp_price", 0),
+                        "qty": p.get("quantity", 0), "conf": p.get("confidence", 0),
+                        "horizon": sym_horizon, "R:R": p.get("rr_ratio", 0),
+                        "risk_pct": p.get("risk_pct", 0), "regime": p.get("regime", "?"),
+                    })
 
                     conn.execute(
                         "INSERT INTO trades (timestamp, symbol, action, entry_price, "
@@ -414,7 +444,6 @@ def run_live_paper():
                     )
                     conn.commit()
 
-                    # Update account state for next symbol
                     account_state["open_trades"] += 1
                     account_state["trades_today"] += 1
 
@@ -427,16 +456,16 @@ def run_live_paper():
                     console.print(f"  [dim]  Pipeline: {decision.economic_rationale[:120]}[/dim]")
 
                 elif decision.status_flag == "NO_SIGNAL":
-                    # Show diagnostic
                     diag = orchestrator.get_diagnostic(sym, df_latest)
+                    _log_thought("NO_SIGNAL", sym, diag[:200])
                     console.print(f"  [dim]{diag}[/dim]")
 
                 elif decision.is_rejected():
-                    # Show why rejected (only if it was a real signal that got blocked)
+                    reason = decision.errors[0] if decision.errors else decision.economic_rationale[:80]
+                    _log_thought("REJECTED", sym, f"by {decision.agent_domain}: {reason}")
                     if decision.agent_domain != "alpha_generator":
                         console.print(
-                            f"  [yellow]{sym}: BLOCKED by {decision.agent_domain} — "
-                            f"{decision.errors[0] if decision.errors else decision.economic_rationale[:80]}[/yellow]"
+                            f"  [yellow]{sym}: BLOCKED by {decision.agent_domain} — {reason}[/yellow]"
                         )
 
             time.sleep(CHECK_INTERVAL)
@@ -560,6 +589,12 @@ def _check_exits(conn, _unused):
             (round(exit_price, 5), round(pnl, 2), exit_reason, trade_id)
         )
         conn.commit()
+
+        _log_thought("EXIT", sym, f"{exit_reason}: {action} closed @ {exit_price:.4f}", {
+            "entry": entry_price, "exit": exit_price, "pnl": round(pnl, 2),
+            "sl_was": sl, "tp_was": tp, "held_bars": "?",
+            "trailing_active": sl != entry_price if exit_reason == "TRAIL" else False,
+        })
 
         color = "green" if pnl > 0 else "red"
         console.print(
