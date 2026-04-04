@@ -108,7 +108,7 @@ def main():
     for symbol in SYMBOLS:
         print(f"\n{'='*60}")
         print(f"Downloading {symbol} (2010-2026, 1H)...")
-        df = download_symbol(symbol, start_year=2010, end_year=2026, workers=20)
+        df = download_symbol(symbol, start_year=2010, end_year=2026, workers=100)
         if not df.empty:
             path = output_dir / f"{symbol}_1H.csv"
             df.to_csv(path)
