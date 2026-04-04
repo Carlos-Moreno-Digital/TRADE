@@ -32,36 +32,41 @@ def download_one_hour(args):
     symbol, pip, dt = args
     # Dukascopy months are 0-indexed!
     url = f"{CDN}/{symbol}/{dt.year}/{dt.month - 1:02d}/{dt.day:02d}/{dt.hour:02d}h_ticks.bi5"
-    try:
-        r = SESSION.get(url, timeout=10)
-        if r.status_code != 200 or len(r.content) < 20:
-            return None
-        data = lzma.decompress(r.content)
-        if len(data) < 20:
-            return None
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            r = SESSION.get(url, timeout=15)
+            if r.status_code != 200 or len(r.content) < 20:
+                return None
+            data = lzma.decompress(r.content)
+            if len(data) < 20:
+                return None
 
-        bids = []
-        vols = []
-        for i in range(0, len(data), 20):
-            if i + 20 > len(data):
-                break
-            ms, ask, bid, avol, bvol = struct.unpack('>IIIff', data[i:i+20])
-            bids.append(bid * pip)
-            vols.append(bvol)
+            bids = []
+            vols = []
+            for i in range(0, len(data), 20):
+                if i + 20 > len(data):
+                    break
+                ms, ask, bid, avol, bvol = struct.unpack('>IIIff', data[i:i+20])
+                bids.append(bid * pip)
+                vols.append(bvol)
 
-        if not bids:
+            if not bids:
+                return None
+
+            return {
+                "timestamp": dt,
+                "open": bids[0],
+                "high": max(bids),
+                "low": min(bids),
+                "close": bids[-1],
+                "volume": sum(vols),
+            }
+        except requests.exceptions.RequestException:
+            import time
+            time.sleep(0.5 * (attempt + 1))  # Back off on network errors
+        except Exception:
             return None
-
-        return {
-            "timestamp": dt,
-            "open": bids[0],
-            "high": max(bids),
-            "low": min(bids),
-            "close": bids[-1],
-            "volume": sum(vols),
-        }
-    except Exception:
-        return None
+    return None
 
 
 def download_symbol(symbol, start_year=2010, end_year=2026, workers=20):
@@ -108,12 +113,30 @@ def main():
     for symbol in SYMBOLS:
         print(f"\n{'='*60}")
         print(f"Downloading {symbol} (2010-2026, 1H)...")
-        df = download_symbol(symbol, start_year=2010, end_year=2026, workers=100)
-        if not df.empty:
+
+        # Download year by year to avoid losing all data on failure
+        all_yearly = []
+        for year in range(2010, 2027):
+            end_year = year + 1
+            if year == 2026:
+                end_year = 2026  # partial
+            print(f"    {year}...", end=" ", flush=True)
+            df_year = download_symbol(symbol, start_year=year, end_year=end_year, workers=30)
+            if not df_year.empty:
+                all_yearly.append(df_year)
+                print(f"{len(df_year)} candles")
+            else:
+                print("no data")
+
+        if all_yearly:
+            import pandas as pd
+            combined = pd.concat(all_yearly).sort_index()
+            # Remove duplicates
+            combined = combined[~combined.index.duplicated(keep='first')]
             path = output_dir / f"{symbol}_1H.csv"
-            df.to_csv(path)
-            years = (df.index[-1] - df.index[0]).days / 365
-            print(f"    DONE: {len(df)} candles, {years:.1f} years → {path}")
+            combined.to_csv(path)
+            years = (combined.index[-1] - combined.index[0]).days / 365
+            print(f"    TOTAL: {len(combined)} candles, {years:.1f} years → {path}")
         else:
             print(f"    NO DATA")
 
