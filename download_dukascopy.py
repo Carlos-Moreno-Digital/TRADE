@@ -1,17 +1,17 @@
-"""Download Dukascopy 1H data directly from CDN — fast parallel version.
+"""Download Dukascopy 1H data — sequential with rate limiting.
 
-Downloads tick data hour by hour, aggregates to 1H OHLCV candles.
-Uses ThreadPool for 10x speed.
+Previous version with 30-100 threads got blocked by Dukascopy CDN.
+This version downloads sequentially with small delays, much more reliable.
+Uses 5 threads max + 50ms delay between requests.
 """
 
 import struct
 import lzma
-import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import numpy as np
 import pandas as pd
 import requests
 
@@ -24,23 +24,19 @@ SYMBOLS = {
 }
 
 CDN = "https://datafeed.dukascopy.com/datafeed"
-SESSION = requests.Session()
 
 
-def download_one_hour(args):
-    """Download and convert one hour of tick data to OHLCV."""
-    symbol, pip, dt = args
-    # Dukascopy months are 0-indexed!
+def download_one_hour(symbol, pip, dt):
+    """Download one hour of tick data, convert to OHLCV."""
     url = f"{CDN}/{symbol}/{dt.year}/{dt.month - 1:02d}/{dt.day:02d}/{dt.hour:02d}h_ticks.bi5"
-    for attempt in range(3):  # Retry up to 3 times
+    for attempt in range(3):
         try:
-            r = SESSION.get(url, timeout=15)
+            r = requests.get(url, timeout=15)
             if r.status_code != 200 or len(r.content) < 20:
                 return None
             data = lzma.decompress(r.content)
             if len(data) < 20:
                 return None
-
             bids = []
             vols = []
             for i in range(0, len(data), 20):
@@ -49,10 +45,8 @@ def download_one_hour(args):
                 ms, ask, bid, avol, bvol = struct.unpack('>IIIff', data[i:i+20])
                 bids.append(bid * pip)
                 vols.append(bvol)
-
             if not bids:
                 return None
-
             return {
                 "timestamp": dt,
                 "open": bids[0],
@@ -61,90 +55,88 @@ def download_one_hour(args):
                 "close": bids[-1],
                 "volume": sum(vols),
             }
-        except requests.exceptions.RequestException:
-            import time
-            time.sleep(0.5 * (attempt + 1))  # Back off on network errors
+        except (requests.exceptions.RequestException, lzma.LZMAError):
+            time.sleep(1 * (attempt + 1))
         except Exception:
             return None
     return None
 
 
-def download_symbol(symbol, start_year=2010, end_year=2026, workers=20):
-    """Download all 1H candles for a symbol using parallel threads."""
-    pip = SYMBOLS[symbol]
+def download_year(symbol, pip, year):
+    """Download one year of 1H data using 5 threads with rate limiting."""
+    start = datetime(year, 1, 1)
+    if year >= 2026:
+        end = datetime(2026, 4, 4)
+    else:
+        end = datetime(year + 1, 1, 1)
 
-    # Build list of all hours to download
+    # Build hour list (include all hours, even weekends — Dukascopy handles it)
     hours = []
-    dt = datetime(start_year, 1, 1)
-    end = datetime(end_year, 4, 1)
+    dt = start
     while dt < end:
-        # Skip weekends (Sat=5, Sun=6) to save time
-        if dt.weekday() < 5:
-            hours.append((symbol, pip, dt))
+        hours.append(dt)
         dt += timedelta(hours=1)
 
-    print(f"    {len(hours)} hours to download ({workers} threads)...")
-
     candles = []
-    done = 0
+    batch_size = 5  # Only 5 concurrent requests
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(download_one_hour, h): h for h in hours}
-        for future in as_completed(futures):
-            done += 1
-            result = future.result()
-            if result:
-                candles.append(result)
-            if done % 2000 == 0:
-                pct = done / len(hours) * 100
-                print(f"    {pct:.0f}% ({done}/{len(hours)}, {len(candles)} candles so far)")
+    for i in range(0, len(hours), batch_size):
+        batch = hours[i:i + batch_size]
+        with ThreadPoolExecutor(max_workers=batch_size) as pool:
+            futures = {pool.submit(download_one_hour, symbol, pip, h): h for h in batch}
+            for f in as_completed(futures):
+                result = f.result()
+                if result:
+                    candles.append(result)
+        # Small delay between batches to avoid rate limiting
+        time.sleep(0.05)
 
-    if not candles:
-        return pd.DataFrame()
+        # Progress every 500 hours
+        if (i + batch_size) % 500 == 0:
+            pct = (i + batch_size) / len(hours) * 100
+            print(f"\r      {pct:.0f}% ({len(candles)} candles)", end="", flush=True)
 
-    df = pd.DataFrame(candles).set_index("timestamp").sort_index()
-    return df
+    return candles
 
 
 def main():
     output_dir = Path("data/dukascopy")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for symbol in SYMBOLS:
+    for symbol, pip in SYMBOLS.items():
+        path = output_dir / f"{symbol}_1H.csv"
         print(f"\n{'='*60}")
         print(f"Downloading {symbol} (2010-2026, 1H)...")
 
-        # Download year by year to avoid losing all data on failure
-        all_yearly = []
-        for year in range(2010, 2027):
-            end_year = year + 1
-            if year == 2026:
-                end_year = 2026  # partial
-            print(f"    {year}...", end=" ", flush=True)
-            df_year = download_symbol(symbol, start_year=year, end_year=end_year, workers=30)
-            if not df_year.empty:
-                all_yearly.append(df_year)
-                print(f"{len(df_year)} candles")
-            else:
-                print("no data")
+        all_candles = []
 
-        if all_yearly:
-            import pandas as pd
-            combined = pd.concat(all_yearly).sort_index()
-            # Remove duplicates
-            combined = combined[~combined.index.duplicated(keep='first')]
-            path = output_dir / f"{symbol}_1H.csv"
-            combined.to_csv(path)
-            years = (combined.index[-1] - combined.index[0]).days / 365
-            print(f"    TOTAL: {len(combined)} candles, {years:.1f} years → {path}")
+        for year in range(2010, 2027):
+            print(f"    {year}...", end=" ", flush=True)
+            candles = download_year(symbol, pip, year)
+            all_candles.extend(candles)
+            print(f"{len(candles)} candles")
+
+            # Save progress after each year
+            if all_candles:
+                df = pd.DataFrame(all_candles).set_index("timestamp").sort_index()
+                df = df[~df.index.duplicated(keep='first')]
+                df.to_csv(path)
+
+        if all_candles:
+            df = pd.DataFrame(all_candles).set_index("timestamp").sort_index()
+            df = df[~df.index.duplicated(keep='first')]
+            df.to_csv(path)
+            years = (df.index[-1] - df.index[0]).days / 365
+            print(f"    TOTAL: {len(df)} candles, {years:.1f} years")
         else:
             print(f"    NO DATA")
 
     print(f"\n{'='*60}")
-    print("All downloads complete!")
+    print("Complete!")
     for f in output_dir.glob("*.csv"):
+        lines = sum(1 for _ in open(f)) - 1
         size = f.stat().st_size / 1024 / 1024
-        print(f"  {f.name}: {size:.1f} MB")
+        print(f"  {f.name}: {lines} candles, {size:.1f} MB")
 
 
 if __name__ == "__main__":
