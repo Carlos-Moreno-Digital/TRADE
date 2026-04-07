@@ -110,26 +110,118 @@ def log(msg: str) -> None:
 # ------------------------------------------------------------------
 # Data loading
 # ------------------------------------------------------------------
+# Bars are loaded with strict priority. The calib CSV is the small
+# 1-month sample produced by download_calibration_data.py and is
+# only useful for spread/depth calibration of the LOB synthesizer;
+# it is NEVER used as the time series for the institutional run.
+#
+# Order of preference for the bar series:
+#   1. data/dukascopy/{SYMBOL}_1H.csv (the historical Dukascopy tape
+#      built by download_dukascopy.py - up to 16 years)
+#   2. yfinance fallback (~2 years of 1H bars) if (1) is missing or
+#      too short
+#
+# A hard minimum of MIN_BARS_REQUIRED rows is enforced — anything
+# below that is considered insufficient for institutional grid
+# search and the script aborts with a clear message.
+
+PRIMARY_HISTORY_FILE = "{symbol}_1H.csv"
+MIN_BARS_REQUIRED = 5_000  # ~7 months of 1H bars at minimum
+
+YFINANCE_TICKERS = {
+    "EURUSD": "EURUSD=X",
+    "USDJPY": "JPY=X",
+    "GBPUSD": "GBPUSD=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "USDCAD": "CAD=X",
+}
+
+
+def _load_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    df = df.set_index("timestamp").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+def _yfinance_fallback(symbol: str) -> pd.DataFrame | None:
+    ticker = YFINANCE_TICKERS.get(symbol)
+    if ticker is None:
+        return None
+    try:
+        import yfinance as yf
+    except ImportError:
+        log("  yfinance not installed; cannot fall back")
+        return None
+    try:
+        df = yf.download(
+            ticker, period="2y", interval="1h",
+            auto_adjust=False, progress=False,
+        )
+    except Exception as e:
+        log(f"  yfinance fallback failed: {e}")
+        return None
+    if df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.lower)
+    df = df[[c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]]
+    df.index.name = "timestamp"
+    df.index = df.index.tz_localize(None)
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    return df
+
+
 def load_full_bars(symbol: str) -> pd.DataFrame:
-    """Prefer the calibrated Dukascopy file, fall back to the long
-    1H CSV (which on the user's VPS contains the full 16y tape)."""
-    candidates = [
-        DATA_DIR / f"{symbol}_calib.csv",
-        DATA_DIR / f"{symbol}_1H.csv",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        df = pd.read_csv(path, parse_dates=["timestamp"])
-        df = df.set_index("timestamp").sort_index()
-        df = df[~df.index.duplicated(keep="first")]
-        if "volume" not in df.columns:
-            df["volume"] = 0.0
-        df = df[["open", "high", "low", "close", "volume"]]
-        log(f"  data: {path.name}  rows={len(df):,}  "
+    """Strict load: full 1H historical first, yfinance fallback second.
+
+    Raises FileNotFoundError if both are missing or both produce
+    fewer than MIN_BARS_REQUIRED rows.
+    """
+    history_path = DATA_DIR / PRIMARY_HISTORY_FILE.format(symbol=symbol)
+
+    df: pd.DataFrame | None = None
+    source: str = ""
+    if history_path.exists():
+        df = _load_csv(history_path)
+        source = history_path.name
+        log(f"  data: {source}  rows={len(df):,}  "
             f"{df.index[0].date()} -> {df.index[-1].date()}")
-        return df
-    raise FileNotFoundError(f"no data file found for {symbol} in {DATA_DIR}")
+        if len(df) < MIN_BARS_REQUIRED:
+            log(
+                f"  WARN: {source} has only {len(df):,} rows "
+                f"(< {MIN_BARS_REQUIRED:,} minimum). "
+                "Trying yfinance fallback for a longer series."
+            )
+            df = None
+
+    if df is None:
+        log(f"  attempting yfinance fallback for {symbol} (~2y 1H)...")
+        df = _yfinance_fallback(symbol)
+        if df is not None:
+            source = f"yfinance:{YFINANCE_TICKERS.get(symbol)}"
+            log(
+                f"  data: {source}  rows={len(df):,}  "
+                f"{df.index[0].date()} -> {df.index[-1].date()}"
+            )
+
+    if df is None or len(df) < MIN_BARS_REQUIRED:
+        n = 0 if df is None else len(df)
+        raise FileNotFoundError(
+            f"insufficient bars for {symbol}: only {n:,} rows available "
+            f"(need >= {MIN_BARS_REQUIRED:,}). "
+            f"Run `python download_dukascopy.py` to fetch the full historical "
+            f"tape, or ensure {history_path} exists with the long series. "
+            f"Note: {DATA_DIR / (symbol + '_calib.csv')} is the calibration "
+            f"sample and is intentionally NOT used for institutional training."
+        )
+
+    return df
 
 
 # ------------------------------------------------------------------
