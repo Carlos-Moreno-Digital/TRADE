@@ -1,12 +1,18 @@
 """Orchestrator Agent — Pipeline Coordination & Consensus.
 
-Coordinates the flow: BBMR Engine → Risk Shield → Compliance → Execute
+Coordinates the flow: Alpha Engine → Risk Shield → Compliance → Execute
 Implements 3-phase consensus protocol.
 Compliance has ABSOLUTE VETO.
 
-NOTE: Previously used XGBoost ML Alpha Generator, but it FAILED on 16 years
-of real Dukascopy data (-$26K, 4/17 profitable years). Replaced with
-Bollinger Band Mean Reversion which validated at +$24,968, 17/17 years.
+HISTORY:
+- XGBoost ML Alpha Generator: FAILED on 16yr Dukascopy (-$26K, 4/17 years).
+- BBMR Engine: FAILED paranoid validation + CPCV + NautilusTrader realistic
+  fills (EURUSD -78.7%, USDJPY -3.8%, WFE 0.06-0.29, time-permutation p>0.15).
+  See VERDICT_BBMR.md. Deleted 2026-04-07.
+
+The alpha slot is intentionally empty until Phase 3 (LOBFrame + Statistical
+Jump Model + NMI dependency matrix) produces a validated strategy that
+survives the full paranoid + CPCV + NautilusTrader gauntlet.
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ from loguru import logger
 from rich.console import Console
 
 from trade.agents.multi import AgentMessage
-from trade.agents.multi.bbmr_engine import BBMREngine
 from trade.agents.multi.risk_shield import RiskShield
 from trade.agents.multi.quant_tester import QuantTester
 from trade.agents.multi.compliance import ComplianceAgent
@@ -30,26 +35,34 @@ console = Console()
 class Orchestrator:
     """Coordinates multi-agent trading pipeline.
 
-    Flow: BBMR Engine → Risk Shield → Compliance → Execute
+    Flow: Alpha Engine → Risk Shield → Compliance → Execute
     3 phases: Collection, Argumentation, Resolution.
     """
 
     def __init__(self):
-        self.alpha = BBMREngine()  # Replaces ML AlphaGenerator
+        self.alpha = None  # Alpha engine slot — empty until Phase 3 validates one
         self.risk = RiskShield()
         self.quant = QuantTester()
         self.compliance = ComplianceAgent()
         self.pipeline_log: list[dict] = []
 
     def train_models(self, symbols: list[str], data: dict[str, pd.DataFrame]) -> dict[str, bool]:
-        """BBMR doesn't need training. Just marks symbols as ready."""
-        return {sym: sym in data for sym in symbols}
+        """No-op until a validated alpha engine is wired in (Phase 3)."""
+        return {sym: False for sym in symbols}
 
     def evaluate(self, sym: str, df: pd.DataFrame, account_state: dict) -> AgentMessage:
         """Run the full pipeline for a symbol.
 
         Returns final decision: APPROVED or REJECTED with full audit trail.
         """
+        if self.alpha is None:
+            raise NotImplementedError(
+                "No alpha engine registered. BBMR was deleted 2026-04-07 after "
+                "failing paranoid validation + CPCV + NautilusTrader realistic "
+                "fills. Phase 3 (LOBFrame + Statistical Jump Model + NMI) is "
+                "expected to produce the next candidate. See VERDICT_BBMR.md."
+            )
+
         pipeline_entry = {
             "symbol": sym,
             "timestamp": datetime.utcnow().isoformat(),
@@ -57,11 +70,11 @@ class Orchestrator:
         }
 
         # ============================================
-        # PHASE 1: COLLECTION — BBMR engine checks conditions
+        # PHASE 1: COLLECTION — alpha engine checks conditions
         # ============================================
         alpha_msg = self.alpha.generate_signal(sym, df)
         pipeline_entry["phases"].append({
-            "agent": "bbmr_engine",
+            "agent": "alpha_engine",
             "status": alpha_msg.status_flag,
             "rationale": alpha_msg.economic_rationale,
         })
