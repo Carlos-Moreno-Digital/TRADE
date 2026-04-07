@@ -179,6 +179,11 @@ def main():
     ))
     console.print(fmt_matrix(nmi_m, colorize=True, decimals=2))
 
+    # ---- Persist matrix for production use by ConcentrationGate ----
+    cache_path = DATA_DIR.parent / "nmi_matrix.csv"
+    nmi_m.to_csv(cache_path)
+    console.print(f"\n  [dim]NMI matrix cached -> {cache_path}[/dim]")
+
     # ---- Pearson for comparison ----
     pearson = rets.corr(method="pearson")
     console.print()

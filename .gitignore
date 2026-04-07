@@ -51,3 +51,4 @@ trades/
 reports/
 *.csv
 !config/**/*.csv
+!data/nmi_matrix.csv

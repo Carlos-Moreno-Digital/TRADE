@@ -13,6 +13,7 @@ import math
 from datetime import datetime
 
 from trade.agents.multi import AgentMessage
+from trade.agents.multi.concentration_gate import ConcentrationGate
 
 # FunderPro Classic $10K limits
 ACCOUNT_SIZE = 10000.0
@@ -33,6 +34,10 @@ LEVERAGE = {"forex": 100, "metals": 30, "indices": 30, "crypto": 2}
 
 class RiskShield:
     """Refines signals with prop firm risk management."""
+
+    def __init__(self, concentration_gate: ConcentrationGate | None = None):
+        # Lazy default so unit tests can pass a mocked gate.
+        self.concentration_gate = concentration_gate or ConcentrationGate()
 
     def validate_and_size(self, signal: AgentMessage, account_state: dict) -> AgentMessage:
         """Apply risk controls to a raw signal from Alpha Generator.
@@ -62,6 +67,27 @@ class RiskShield:
                 status_flag="BLOCKED",
                 errors=[f"StoplossGuard: {sym} hit SL {sym_recent_sl} times recently. Cooling down."],
                 economic_rationale=f"Symbol {sym} is in a losing streak — blocked until pattern changes",
+            )
+
+        # === CONCENTRATION GATE (NMI dependency) ===
+        # Block redundant positions: anything in the same NMI cluster as
+        # an already-open position is the same bet under another ticker.
+        open_syms = [
+            p.get("symbol", "")
+            for p in account_state.get("open_positions", [])
+            if p.get("symbol")
+        ]
+        gate_decision = self.concentration_gate.check(sym, open_syms)
+        if not gate_decision.allowed:
+            return AgentMessage(
+                agent_domain="risk_shield",
+                status_flag="BLOCKED",
+                errors=[gate_decision.reason],
+                economic_rationale=(
+                    f"ConcentrationGate: {sym} would stack risk on "
+                    f"{gate_decision.conflicting_symbol} "
+                    f"(NMI={gate_decision.nmi_value:.3f})"
+                ),
             )
 
         # === KILL SWITCH: Daily loss ===
