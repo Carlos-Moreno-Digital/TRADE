@@ -13,7 +13,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import talib
+
+from trade.research.indicators import ATR
 
 
 class DummyRandom:
@@ -60,7 +61,7 @@ class DummyRandom:
         low = df["low"].values.astype(float)
         n = len(close)
 
-        atr = talib.ATR(high, low, close, timeperiod=14)
+        atr = ATR(high, low, close, period=14)
 
         rng = np.random.default_rng(params.get("seed", 42))
         entry_prob = params["entry_prob"]

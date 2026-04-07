@@ -15,11 +15,19 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
 
-    # Technical Analysis
-    "ta-lib>=0.6",
+    # Technical Analysis: pure-numpy/pandas in src/trade/research/indicators.py
+    # ta-lib was REMOVED in Phase 5.1 to avoid the C build dependency on
+    # the production VPS. ATR, BB, ADX, EMA, SMA and RSI all live in
+    # trade.research.indicators and are unit-verified against ta-lib.
 
     # AI/ML Agent Framework
     "dspy>=2.5",
+
+    # Statistical models and tests (Engle-Granger, ADF, ARIMA)
+    "statsmodels>=0.14",
+
+    # Event-driven backtest engine
+    "nautilus_trader>=1.220",
 
     # Risk & Portfolio
     "scipy>=1.11",

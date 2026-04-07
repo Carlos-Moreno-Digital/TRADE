@@ -55,8 +55,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import talib
 
+from trade.research.indicators import ATR
 from trade.research.regimes.features import build_features
 from trade.research.regimes.jump_model import StatisticalJumpModel
 
@@ -167,7 +167,7 @@ class RegimeMomentum:
         mr_z_entry = float(params["mr_z_entry"])
         mr_z_exit = float(params.get("mr_z_exit", self.default_params["mr_z_exit"]))
 
-        atr = talib.ATR(high, low, close, timeperiod=atr_period)
+        atr = ATR(high, low, close, period=atr_period)
         # Donchian channels: ROLLING max/min over [t-period : t-1]
         # (use shift(1) so we never read bar t when deciding at bar t).
         s_high = pd.Series(high)

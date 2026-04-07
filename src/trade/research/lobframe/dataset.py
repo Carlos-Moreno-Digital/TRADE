@@ -45,10 +45,10 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
-import talib
 import torch
 from torch.utils.data import Dataset
 
+from trade.research.indicators import ATR
 from trade.research.lobframe.data_schema import column_index
 
 
@@ -103,9 +103,9 @@ class LOBWindowDataset(Dataset):
             self._high = bars["high"].to_numpy(dtype=float)
             self._low = bars["low"].to_numpy(dtype=float)
             self._close = bars["close"].to_numpy(dtype=float)
-            self._atr = talib.ATR(
+            self._atr = ATR(
                 self._high, self._low, self._close,
-                timeperiod=self.cfg.tb_atr_period,
+                period=self.cfg.tb_atr_period,
             )
             forward_bars = self.cfg.tb_vertical_bars
         else:

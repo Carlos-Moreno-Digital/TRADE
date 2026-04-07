@@ -24,9 +24,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import talib
 import torch
 
+from trade.research.indicators import ATR
 from trade.research.lobframe import (
     calibrated_config,
     column_index,
@@ -122,7 +122,7 @@ class DeepLOBStrategy:
         low = bars["low"].to_numpy(dtype=float)
         n = len(close)
 
-        atr = talib.ATR(high, low, close, timeperiod=14)
+        atr = ATR(high, low, close, period=14)
         logits, t_indices = self._logits_for_bars(bars)
         if logits.size == 0:
             return [] if not collect_signals else pd.DataFrame(
