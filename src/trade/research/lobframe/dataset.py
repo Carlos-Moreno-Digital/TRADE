@@ -45,8 +45,29 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
+
+# Torch is OPTIONAL: this module is also imported by the LOBFrame
+# leakage suite (which only needs the labelling logic) and by the
+# institutional Meta-Labelling pipeline (which uses RandomForest, not
+# DeepLOB). On VPS deployments where torch is not installed we want
+# to be able to import LOBDatasetConfig / LabelMethod / _label_*
+# without crashing. The PyTorch-only methods (__getitem__,
+# class_weights, ...) raise a clear runtime error if torch is missing.
+try:
+    import torch  # noqa: F401
+    from torch.utils.data import Dataset as _TorchDataset
+    _HAVE_TORCH = True
+except ImportError:  # pragma: no cover - exercised only on torch-less VPS
+    _HAVE_TORCH = False
+
+    class _TorchDataset:  # type: ignore[no-redef]
+        """Stub used as a base class when torch is unavailable.
+
+        Allows LOBWindowDataset to be defined and instantiated for the
+        leakage tests / labelling logic. Methods that actually need
+        torch raise at call time.
+        """
+        pass
 
 from trade.research.indicators import ATR
 from trade.research.lobframe.data_schema import column_index
@@ -71,7 +92,7 @@ class LOBDatasetConfig:
     tb_vertical_bars: int = 50
 
 
-class LOBWindowDataset(Dataset):
+class LOBWindowDataset(_TorchDataset):
     def __init__(
         self,
         tensor: np.ndarray,
@@ -182,7 +203,14 @@ class LOBWindowDataset(Dataset):
         return self._label_mid_horizon(t)
 
     # ------------------------------------------------------------------
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
+        if not _HAVE_TORCH:
+            raise RuntimeError(
+                "LOBWindowDataset.__getitem__ requires PyTorch. "
+                "Install torch (`pip install torch`) to use the DeepLOB "
+                "training pipeline; the labelling logic is available "
+                "without it."
+            )
         t = self._min_t + idx
         win = self.tensor[t - self.cfg.window + 1 : t + 1]
         if self.cfg.normalize:
@@ -203,10 +231,16 @@ class LOBWindowDataset(Dataset):
             counts[self._label(t)] += 1
         return counts
 
-    def class_weights(self) -> torch.Tensor:
+    def class_weights(self):
         """Inverse-frequency weights normalised so they sum to n_classes.
         Use as `nn.CrossEntropyLoss(weight=ds.class_weights())`.
+        Returns a torch.Tensor; requires torch to be installed.
         """
+        if not _HAVE_TORCH:
+            raise RuntimeError(
+                "LOBWindowDataset.class_weights requires PyTorch. "
+                "Install torch to use the DeepLOB training pipeline."
+            )
         dist = self.label_distribution()
         counts = np.array([dist[i] for i in (0, 1, 2)], dtype=float)
         inv = 1.0 / np.maximum(counts, 1.0)

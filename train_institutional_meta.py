@@ -65,7 +65,6 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import joblib
 
-from trade.research.indicators import ATR
 from trade.research.lobframe import calibrated_config
 from trade.research.lobframe.leakage_tests import run_all as run_leakage
 from trade.research.strategies.meta_labelling import (
@@ -74,7 +73,6 @@ from trade.research.strategies.meta_labelling import (
     _triple_barrier_label,
 )
 from trade.research.strategies.regime_momentum import RegimeMomentum
-from trade.validation.nautilus_harness import NautilusHarness
 from trade.validation.purged_kfold import (
     PurgedKFoldFold,
     purged_kfold_predict_proba,
