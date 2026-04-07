@@ -26,6 +26,9 @@ dependencies = [
     # Statistical models and tests (Engle-Granger, ADF, ARIMA)
     "statsmodels>=0.14",
 
+    # Tensor reshaping for SOTA time-series architectures (PatchTST etc.)
+    "einops>=0.7",
+
     # Event-driven backtest engine
     "nautilus_trader>=1.220",
 

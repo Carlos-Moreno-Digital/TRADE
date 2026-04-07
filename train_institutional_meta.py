@@ -65,17 +65,23 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import joblib
 
+from sklearn.ensemble import RandomForestRegressor
+
 from trade.research.lobframe import calibrated_config
 from trade.research.lobframe.leakage_tests import run_all as run_leakage
 from trade.research.strategies.meta_labelling import (
     META_FEATURE_COLS,
     _build_meta_features,
-    _triple_barrier_label,
+    _triple_barrier_pnl,
 )
 from trade.research.strategies.regime_momentum import RegimeMomentum
 from trade.validation.purged_kfold import (
     PurgedKFoldFold,
-    purged_kfold_predict_proba,
+    purged_kfold_oof_predict,
+)
+from trade.validation.sample_weights import (
+    average_uniqueness,
+    normalize_to_sum_n,
 )
 
 DATA_DIR = Path("data/dukascopy")
@@ -89,17 +95,25 @@ PAIR_BY_SYMBOL = {"EURUSD": "EUR/USD", "USDJPY": "USD/JPY"}
 SPREAD_BY_SYMBOL = {"EURUSD": 8e-5, "USDJPY": 8e-3}
 
 # Coarse grid — small enough to fit in a few hours on 2 vCPU.
+# Phase 8c: max_holding is for the PRIMARY's internal walker only;
+# the production walker has no time stop. vertical_bars in META_GRID
+# is the LABEL HORIZON CAP for the regression target.
 PRIMARY_GRID: dict = {
     "donchian_period": [15, 20, 30],
     "atr_sl_mult": [1.0, 1.5],
     "atr_tp_mult": [2.0, 3.0],
     "max_holding": [12, 24],
 }
+# meta_threshold is now in PRICE UNITS (PnL per unit). 0 means
+# "any predicted profit"; the spread floor is enforced inside
+# evaluate_combo regardless. Negative thresholds are NOT useful
+# (we'd be accepting predicted losses).
 META_GRID: dict = {
     "rf_n_estimators": [50, 100],
     "rf_max_depth": [4, 6],
     "rf_min_samples_leaf": [5],
-    "meta_threshold": [0.40, 0.50, 0.60],
+    "vertical_bars": [50, 100],
+    "meta_threshold": [0.0, 0.0001, 0.0003],
 }
 
 
@@ -231,8 +245,16 @@ def walk_positions(
     bars: pd.DataFrame,
     spread: float,
     kept_signals: list[dict],
-    max_holding: int,
 ) -> list[float]:
+    """Phase 8c production walker — NO max_holding.
+
+    Trades close ONLY when TP or SL is touched. Pessimistic SL-first
+    ordering on intra-bar conflicts. Any position still open at the
+    end of the data is force-closed at the last bar's close (this
+    only affects the very last open position of the entire backtest).
+
+    Spread cost is charged round-trip = spread * qty * 2.
+    """
     close = bars["close"].to_numpy(dtype=float)
     high = bars["high"].to_numpy(dtype=float)
     low = bars["low"].to_numpy(dtype=float)
@@ -259,15 +281,13 @@ def walk_positions(
                 "sl": sl, "tp": tp, "qty": qty,
             }
             continue
-        bars_held = i - pos["idx"]
+        # TP/SL only — no time stop. SL wins ties.
         exit_price = None
         if pos["side"] == "buy":
             if low[i] <= pos["sl"]:
                 exit_price = pos["sl"]
             elif high[i] >= pos["tp"]:
                 exit_price = pos["tp"]
-            elif bars_held >= max_holding:
-                exit_price = close[i]
             if exit_price is not None:
                 pnl = (exit_price - pos["entry"]) * pos["qty"] - spread * pos["qty"] * 2
                 pnls.append(pnl)
@@ -278,13 +298,19 @@ def walk_positions(
                 exit_price = pos["sl"]
             elif low[i] <= pos["tp"]:
                 exit_price = pos["tp"]
-            elif bars_held >= max_holding:
-                exit_price = close[i]
             if exit_price is not None:
                 pnl = (pos["entry"] - exit_price) * pos["qty"] - spread * pos["qty"] * 2
                 pnls.append(pnl)
                 equity += pnl
                 pos = None
+    # Force-close any position open at end-of-data
+    if pos is not None:
+        last_close = close[-1]
+        if pos["side"] == "buy":
+            pnl = (last_close - pos["entry"]) * pos["qty"] - spread * pos["qty"] * 2
+        else:
+            pnl = (pos["entry"] - last_close) * pos["qty"] - spread * pos["qty"] * 2
+        pnls.append(pnl)
     return pnls
 
 
@@ -321,45 +347,58 @@ def compute_metrics(pnls: list[float], periods_per_year: int = 220) -> dict:
 # ------------------------------------------------------------------
 # Per-combo evaluation: signals -> labels -> purged kfold -> walk
 # ------------------------------------------------------------------
-def extract_signal_features_and_labels(
+def extract_signal_features_and_pnl(
     bars: pd.DataFrame,
     signals: pd.DataFrame,
     feats: pd.DataFrame,
-    max_holding: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build the (X, y, signal_bar_idx) triple from a primary signals
-    DataFrame. Drops signals whose feature row contains NaN.
+    vertical_bars: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Phase 8c: build (X, y, sig_starts, sig_ends) from primary signals.
+
+    y is now realised PnL per unit from the triple-barrier walk
+    (regression target). sig_starts / sig_ends are bar indices that
+    delimit each signal's label horizon — used to compute the
+    average uniqueness sample weights.
     """
     high = bars["high"].to_numpy(dtype=float)
     low = bars["low"].to_numpy(dtype=float)
+    close = bars["close"].to_numpy(dtype=float)
 
-    rows = []
-    labels = []
-    bar_idx = []
-    for s in signals.itertuples():
+    rows: list[list[float]] = []
+    targets: list[float] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    valid_idx: list[int] = []
+    for k, s in enumerate(signals.itertuples()):
         t0 = int(s.bar_idx) - 1
         if t0 < 0 or t0 >= len(feats):
             continue
         f = feats.iloc[t0]
         if f.isna().any():
             continue
-        label = _triple_barrier_label(
-            t0, s.side, float(s.sl), float(s.tp), high, low, max_holding,
+        entry = float(close[t0])
+        pnl_per_unit, _exit, exit_offset = _triple_barrier_pnl(
+            t0, s.side, entry, float(s.sl), float(s.tp),
+            high, low, close, vertical_bars,
         )
         row = list(f.values) + [1.0 if s.side == "buy" else 0.0]
         rows.append(row)
-        labels.append(label)
-        bar_idx.append(t0)
+        targets.append(pnl_per_unit)
+        starts.append(t0)
+        ends.append(t0 + exit_offset)
+        valid_idx.append(k)
     if not rows:
         return (
-            np.empty((0, len(META_FEATURE_COLS)), dtype=float),
+            np.empty((0, len(META_FEATURE_COLS) + 1), dtype=float),
+            np.empty(0, dtype=float),
             np.empty(0, dtype=int),
             np.empty(0, dtype=int),
         )
     return (
         np.array(rows, dtype=float),
-        np.array(labels, dtype=int),
-        np.array(bar_idx, dtype=int),
+        np.array(targets, dtype=float),
+        np.array(starts, dtype=int),
+        np.array(ends, dtype=int),
     )
 
 
@@ -381,8 +420,9 @@ def evaluate_combo(
                 "valid": False, "reason": "no primary signals"}
 
     feats = _build_meta_features(bars, atr_period=int(primary_params["atr_period"]))
-    X, y, sig_bar_idx = extract_signal_features_and_labels(
-        bars, signals, feats, int(primary_params["max_holding"])
+    vertical_bars = int(meta_params.get("vertical_bars", 100))
+    X, y, sig_starts, sig_ends = extract_signal_features_and_pnl(
+        bars, signals, feats, vertical_bars,
     )
     if len(X) < min_labels:
         return {"n_signals": n_primary, "n_labelled": int(len(X)),
@@ -390,34 +430,45 @@ def evaluate_combo(
                 "metrics": compute_metrics([]),
                 "valid": False, "reason": f"<{min_labels} labelled signals"}
 
+    # Sample uniqueness over ALL labelled signals (Lopez de Prado AFML
+    # ch 4). Computed once globally; the purged K-fold then indexes
+    # into this array per fold.
+    n_bars_total = max(int(sig_ends.max()) + 1, len(bars))
+    weights = average_uniqueness(sig_starts, sig_ends, n_bars=n_bars_total)
+    if weights.sum() <= 0:
+        weights = np.ones_like(weights)
+    weights = normalize_to_sum_n(weights)
+
     def factory():
-        return RandomForestClassifier(
+        return RandomForestRegressor(
             n_estimators=int(meta_params["rf_n_estimators"]),
             max_depth=int(meta_params["rf_max_depth"]),
             min_samples_leaf=int(meta_params["rf_min_samples_leaf"]),
             random_state=42,
             n_jobs=1,
-            class_weight="balanced",
         )
 
-    oos_probs, folds = purged_kfold_predict_proba(
+    oos_pred, folds = purged_kfold_oof_predict(
         X=X, y=y,
-        signal_bar_indices=sig_bar_idx,
-        label_horizon=int(primary_params["max_holding"]),
+        signal_bar_indices=sig_starts,
+        label_horizon=vertical_bars,
         n_splits=n_splits,
         embargo_bars=embargo_bars,
-        classifier_factory=factory,
-        progress_fn=None,  # silent inside the inner loop
+        estimator_factory=factory,
+        sample_weights=weights,
+        mode="predict",
+        progress_fn=None,
     )
 
+    # Phase 8c filter: keep only signals whose predicted PnL beats the
+    # round-trip spread cost. Threshold is in price units per unit.
     threshold = float(meta_params["meta_threshold"])
-    keep_mask = (~np.isnan(oos_probs)) & (oos_probs >= threshold)
+    min_pnl_per_unit = max(threshold, 2.0 * spread)
+    keep_mask = (~np.isnan(oos_pred)) & (oos_pred >= min_pnl_per_unit)
 
-    valid_signals = signals.iloc[: len(X)]  # rows that produced labels
+    valid_signals = signals.iloc[: len(X)]
     kept_records = valid_signals.iloc[keep_mask].to_dict("records")
-    pnls = walk_positions(
-        bars, spread, kept_records, int(primary_params["max_holding"])
-    )
+    pnls = walk_positions(bars, spread, kept_records)
     metrics = compute_metrics(pnls)
     return {
         "n_signals": n_primary,
@@ -531,33 +582,44 @@ def main() -> int:
         f"kept={best['n_kept']} filter_rate={best['filter_rate']}")
 
     # ---- Final fit on all signals ----
-    log("\n=== Final fit on all signals ===")
+    log("\n=== Final fit on all signals (PnL regressor + uniqueness) ===")
     final_primary_params = dict(base_primary)
     final_primary_params.update(best["primary_params"])
     signals = primary.signals(bars, final_primary_params)
     feats = _build_meta_features(bars, atr_period=int(final_primary_params["atr_period"]))
-    X, y, _ = extract_signal_features_and_labels(
-        bars, signals, feats, int(final_primary_params["max_holding"])
+    final_vertical = int(best["meta_params"].get("vertical_bars", 100))
+    X, y, sig_starts, sig_ends = extract_signal_features_and_pnl(
+        bars, signals, feats, final_vertical,
     )
-    if len(X) >= 30 and len(np.unique(y)) >= 2:
-        final_rf = RandomForestClassifier(
+    if len(X) >= 30:
+        n_bars_total = max(int(sig_ends.max()) + 1, len(bars))
+        weights = average_uniqueness(sig_starts, sig_ends, n_bars=n_bars_total)
+        if weights.sum() <= 0:
+            weights = np.ones_like(weights)
+        weights = normalize_to_sum_n(weights)
+        final_rf = RandomForestRegressor(
             n_estimators=int(best["meta_params"]["rf_n_estimators"]),
             max_depth=int(best["meta_params"]["rf_max_depth"]),
             min_samples_leaf=int(best["meta_params"]["rf_min_samples_leaf"]),
             random_state=42,
             n_jobs=1,
-            class_weight="balanced",
         )
-        final_rf.fit(X, y)
+        final_rf.fit(X, y, sample_weight=weights)
         model_path = MODELS_DIR / f"meta_rf_{sym}.joblib"
         joblib.dump({
-            "rf": final_rf,
+            "estimator": final_rf,
+            "kind": "RandomForestRegressor",
+            "target": "realized_pnl_per_unit",
             "feature_cols": META_FEATURE_COLS,
             "primary_params": best["primary_params"],
             "meta_params": best["meta_params"],
             "n_train_samples": int(len(X)),
+            "spread": float(spread),
+            "uniqueness_mean": float(weights.mean()),
         }, model_path)
         log(f"  model -> {model_path}")
+        log(f"  uniqueness mean={weights.mean():.3f} min={weights.min():.3f} "
+            f"max={weights.max():.3f}")
     else:
         log("  WARN: insufficient labels for final fit, skipping model dump")
 

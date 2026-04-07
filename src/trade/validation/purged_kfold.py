@@ -118,38 +118,49 @@ def make_purged_folds(
     return folds
 
 
-def purged_kfold_predict_proba(
+def purged_kfold_oof_predict(
     X: np.ndarray,
     y: np.ndarray,
     signal_bar_indices: np.ndarray,
     label_horizon: int,
     n_splits: int,
     embargo_bars: int,
-    classifier_factory: Callable[[], object],
+    estimator_factory: Callable[[], object],
+    sample_weights: np.ndarray | None = None,
+    mode: str = "proba",
     progress_fn: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, list[PurgedKFoldFold]]:
-    """Run purged K-Fold and return one OOS probability per signal.
+    """Run purged K-Fold and return one OOS prediction per signal.
 
     Parameters
     ----------
     X : (n, d) feature matrix, one row per signal
-    y : (n,) binary labels
+    y : (n,) target (binary labels OR regression target)
     signal_bar_indices : (n,) bar index of each signal
     label_horizon : int
-        Maximum forward horizon used by the labelling
     n_splits : int
     embargo_bars : int
-    classifier_factory : callable returning a fresh sklearn classifier
-        with .fit(X, y) and .predict_proba(X) -> (n, 2)
+    estimator_factory : callable returning a fresh sklearn estimator
+        - mode='proba' : must implement .predict_proba(X) -> (n, 2)
+                         and .classes_
+        - mode='predict': must implement .predict(X) -> (n,)
+    sample_weights : (n,) optional, passed to .fit() as sample_weight.
+        Computed once globally over ALL signals (e.g. via
+        trade.validation.sample_weights.average_uniqueness) and indexed
+        per fold.
+    mode : 'proba' or 'predict'
     progress_fn : optional one-line logger called per fold
 
     Returns
     -------
-    (oos_probs, folds)
-        oos_probs : (n,) probability of class 1 for each signal,
-                    computed entirely OUT-OF-SAMPLE.
-        folds : the PurgedKFoldFold list with diagnostics.
+    (oos_values, folds)
+        oos_values : (n,) NaN where the fold was skipped, else either
+                     class-1 probability (proba mode) or .predict()
+                     output (predict mode), computed strictly OOS.
     """
+    if mode not in ("proba", "predict"):
+        raise ValueError(f"mode must be 'proba' or 'predict', got {mode!r}")
+
     n = len(X)
     out = np.full(n, np.nan, dtype=float)
     folds = make_purged_folds(
@@ -167,23 +178,34 @@ def purged_kfold_predict_proba(
             continue
         X_train = X[train_idx]
         y_train = y[train_idx]
-        if len(np.unique(y_train)) < 2:
+        if mode == "proba" and len(np.unique(y_train)) < 2:
             if progress_fn:
                 progress_fn(
                     f"  fold {f.fold_id+1}/{n_splits}: skip "
                     f"(degenerate target)"
                 )
             continue
-        clf = classifier_factory()
-        clf.fit(X_train, y_train)
+        clf = estimator_factory()
+        fit_kwargs = {}
+        if sample_weights is not None:
+            fit_kwargs["sample_weight"] = sample_weights[train_idx]
+        try:
+            clf.fit(X_train, y_train, **fit_kwargs)
+        except TypeError:
+            # Some estimators reject sample_weight in fit kwargs
+            clf.fit(X_train, y_train)
+
         X_test = X[test_idx]
-        probs = clf.predict_proba(X_test)
-        # Pick the class-1 column robustly (sklearn orders classes_)
-        if hasattr(clf, "classes_") and 1 in list(clf.classes_):
-            class1_col = list(clf.classes_).index(1)
+        if mode == "proba":
+            probs = clf.predict_proba(X_test)
+            if hasattr(clf, "classes_") and 1 in list(clf.classes_):
+                class1_col = list(clf.classes_).index(1)
+            else:
+                class1_col = probs.shape[1] - 1
+            out[test_idx] = probs[:, class1_col]
         else:
-            class1_col = probs.shape[1] - 1
-        out[test_idx] = probs[:, class1_col]
+            out[test_idx] = clf.predict(X_test)
+
         if progress_fn:
             progress_fn(
                 f"  fold {f.fold_id+1}/{n_splits}: "
@@ -191,3 +213,27 @@ def purged_kfold_predict_proba(
                 f"purged={f.n_purged} embargoed={f.n_embargoed}"
             )
     return out, folds
+
+
+def purged_kfold_predict_proba(
+    X: np.ndarray,
+    y: np.ndarray,
+    signal_bar_indices: np.ndarray,
+    label_horizon: int,
+    n_splits: int,
+    embargo_bars: int,
+    classifier_factory: Callable[[], object],
+    progress_fn: Callable[[str], None] | None = None,
+) -> tuple[np.ndarray, list[PurgedKFoldFold]]:
+    """Backwards-compatible wrapper for the classifier path."""
+    return purged_kfold_oof_predict(
+        X=X, y=y,
+        signal_bar_indices=signal_bar_indices,
+        label_horizon=label_horizon,
+        n_splits=n_splits,
+        embargo_bars=embargo_bars,
+        estimator_factory=classifier_factory,
+        sample_weights=None,
+        mode="proba",
+        progress_fn=progress_fn,
+    )
