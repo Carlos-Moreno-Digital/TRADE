@@ -6,7 +6,9 @@ References:
   - Cont, R. & Stoikov, S. (2014). Order book dynamics in liquid markets.
 """
 from trade.research.lobframe.cont_stoikov import (
+    CALIBRATED_CONFIGS,
     ContStoikovConfig,
+    calibrated_config,
     synthesize_lob,
     synthesize_snapshots,
 )
@@ -30,6 +32,8 @@ from trade.research.lobframe.nautilus_bridge import LOBFrameBridge
 
 __all__ = [
     "ContStoikovConfig",
+    "CALIBRATED_CONFIGS",
+    "calibrated_config",
     "synthesize_lob",
     "synthesize_snapshots",
     "LEVELS",

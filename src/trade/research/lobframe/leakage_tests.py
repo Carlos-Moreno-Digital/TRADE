@@ -126,6 +126,34 @@ def test_no_nans(bars: pd.DataFrame, cfg: ContStoikovConfig) -> bool:
     return bool(np.isfinite(arr).all())
 
 
+def test_forward_impact(bars: pd.DataFrame, cfg: ContStoikovConfig) -> bool:
+    """Forward impact: perturbing close[t] must alter lob[t+1:] AND
+    leave lob[:t+1] byte-identical.
+
+    This is the COMPLEMENT to the no-*-leakage tests:
+      - no_close_leakage proves the past is not contaminated
+      - forward_impact proves the past actually flows into the future
+        (otherwise the generator would be a constant!)
+
+    Both must hold for the causal contract to be meaningful.
+    """
+    if len(bars) < 50:
+        return True
+    base = _baseline(bars, cfg)
+    perturbed = bars.copy()
+    pivot = min(50, len(bars) - 5)
+    perturbed.loc[perturbed.index[pivot], "close"] += 0.01
+    p = synthesize_lob(perturbed, cfg)
+
+    # Past must be untouched
+    past_unchanged = bool(np.array_equal(base[: pivot + 1], p[: pivot + 1]))
+    # Future MUST differ on at least one row, and the very next row should
+    # be the first one to react (because lob[t+1] uses close[t]).
+    future_diff = not np.array_equal(base[pivot + 1 :], p[pivot + 1 :])
+    next_row_diff = not np.array_equal(base[pivot + 1], p[pivot + 1])
+    return past_unchanged and future_diff and next_row_diff
+
+
 def test_past_only_pivot(bars: pd.DataFrame, cfg: ContStoikovConfig) -> bool:
     """If we slice bars at two different lengths but >= the pivot, the
     rows up to the pivot must be byte-identical between the two runs.
@@ -150,6 +178,7 @@ ALL_TESTS = {
     "volume_positivity": test_volume_positivity,
     "no_nans": test_no_nans,
     "past_only_pivot": test_past_only_pivot,
+    "forward_impact": test_forward_impact,
 }
 
 

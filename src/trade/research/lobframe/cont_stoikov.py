@@ -55,14 +55,45 @@ class ContStoikovConfig:
     levels: int = LEVELS
     window: int = 20            # bars used for vol/volume rolling
     base_spread: float = 1e-4   # ~1 pip for FX major
-    alpha_vol: float = 5.0      # spread sensitivity to vol
-    scale_vol: float = 1e-3     # vol normalizer
+    # Roll-model spread amplification: spread = max(base, k_vol * vol)
+    k_vol: float = 0.08
+    spread_clip: float = 5e-3   # hard upper cap (50 pips)
     vol_floor: float = 1e-5
-    depth_scale: float = 1.0    # divide rolling volume by this
-    depth_unit_floor: float = 1.0
+    # Depth: real liquidity proxy.
+    # depth = depth_ref * sqrt(volume / volume_ref) clipped to >= depth_min
+    depth_ref: float = 1_000_000.0  # institutional reference top-of-book size
+    volume_ref: float = 1.0          # rolling volume that maps to depth_ref
+    depth_min: float = 1.0
     decay: float = 0.25         # exponential book decay across levels
     jitter_amplitude: float = 0.05  # +/- 5% per-level volume noise
     seed: int = 42
+
+
+# Per-symbol calibrated configs (institutional targets).
+# Key is the normalized symbol name (no =X suffix).
+CALIBRATED_CONFIGS: dict[str, "ContStoikovConfig"] = {
+    "EURUSD": ContStoikovConfig(
+        base_spread=8e-5,         # 0.8 pip floor
+        k_vol=0.05,               # spread ~ 0.05 * realized vol
+        spread_clip=5e-4,         # cap at 5 pips
+        depth_ref=2_000_000.0,    # 2M units top of book
+        volume_ref=1500.0,        # ~1500 ticks/hour avg
+    ),
+    "USDJPY": ContStoikovConfig(
+        base_spread=8e-3,         # 0.8 pip floor in JPY units
+        k_vol=0.05,
+        spread_clip=5e-2,         # cap at 50 pips
+        depth_ref=2_000_000.0,
+        volume_ref=1500.0,
+    ),
+}
+
+
+def calibrated_config(symbol: str) -> "ContStoikovConfig":
+    sym = symbol.upper().replace("=X", "").replace("^", "")
+    aliases = {"JPY": "USDJPY", "CAD": "USDCAD", "GC": "XAUUSD", "GSPC": "SPX"}
+    sym = aliases.get(sym, sym)
+    return CALIBRATED_CONFIGS.get(sym, ContStoikovConfig())
 
 
 def _check_bars(bars: pd.DataFrame) -> None:
@@ -104,7 +135,7 @@ def synthesize_lob(
         if t == 0:
             mid = closes[0]
             vol_t = cfg.vol_floor
-            depth_unit = cfg.depth_unit_floor
+            depth_unit = cfg.depth_min
         else:
             mid = closes[t - 1]
             lookback_lo = max(0, t - cfg.window)
@@ -117,12 +148,18 @@ def synthesize_lob(
             vol_t = max(vol_t, cfg.vol_floor)
             vol_window_volumes = volumes[lookback_lo:lookback_hi]
             if vol_window_volumes.size > 0:
-                depth_unit = float(np.mean(vol_window_volumes)) / cfg.depth_scale
+                vol_proxy = float(np.mean(vol_window_volumes))
             else:
-                depth_unit = cfg.depth_unit_floor
-            depth_unit = max(depth_unit, cfg.depth_unit_floor)
+                vol_proxy = 0.0
+            # Square-root liquidity scaling (Cont-Stoikov style):
+            # depth ~ depth_ref * sqrt(volume / volume_ref)
+            ratio = max(vol_proxy / cfg.volume_ref, 0.0)
+            depth_unit = cfg.depth_ref * np.sqrt(ratio) if ratio > 0 else cfg.depth_min
+            depth_unit = max(depth_unit, cfg.depth_min)
 
-        spread_t = cfg.base_spread * (1.0 + cfg.alpha_vol * vol_t / cfg.scale_vol)
+        # Roll-model spread: max of floor and vol-driven term, hard-clipped
+        spread_t = max(cfg.base_spread, cfg.k_vol * vol_t * mid)
+        spread_t = min(spread_t, cfg.spread_clip)
         tick_t = spread_t / 2.0
         half_spread = spread_t / 2.0
 
