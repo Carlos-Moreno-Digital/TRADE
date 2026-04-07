@@ -1,5 +1,6 @@
 # Data (large binary datasets, not checked in)
 data/dukascopy/*.csv
+data/models/*.pt
 
 # Environment
 .env
