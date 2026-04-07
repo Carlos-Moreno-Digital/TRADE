@@ -81,6 +81,8 @@ def train_deeplob(
     dataset_cfg: LOBDatasetConfig | None = None,
     model: DeepLOB | None = None,
     log_fn=None,
+    bars=None,
+    class_weights: torch.Tensor | None = None,
 ) -> tuple[DeepLOB, list[EpochSummary]]:
     """Train DeepLOB on a (T, 40) LOBFrame tensor.
 
@@ -95,7 +97,7 @@ def train_deeplob(
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    full = LOBWindowDataset(tensor, dataset_cfg)
+    full = LOBWindowDataset(tensor, dataset_cfg, bars=bars)
     train_idx, val_idx = temporal_split(len(full), cfg.val_fraction)
     if len(train_idx) < cfg.batch_size or len(val_idx) < cfg.batch_size:
         raise ValueError(
@@ -119,7 +121,9 @@ def train_deeplob(
     optim = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    criterion = nn.CrossEntropyLoss()
+    if class_weights is not None:
+        class_weights = class_weights.to(cfg.device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_val = float("inf")
     best_state: dict | None = None

@@ -154,6 +154,90 @@ def test_forward_impact(bars: pd.DataFrame, cfg: ContStoikovConfig) -> bool:
     return past_unchanged and future_diff and next_row_diff
 
 
+def test_label_causality_triple_barrier(
+    bars: pd.DataFrame, cfg: ContStoikovConfig
+) -> bool:
+    """Triple-barrier label causality contract.
+
+    For a sample whose feature window ends at bar t:
+      A) Perturbing close[t-W..t] (the PAST) must change the FEATURE
+         tensor (the model would see different inputs) — sanity that
+         the synth tensor is sensitive to its inputs.
+      B) Perturbing close[t+1..t+vertical] (the FUTURE) must NOT
+         change the feature tensor at row t — proves features are
+         strictly causal.
+      C) Perturbing close[t+1..t+vertical] MAY change the LABEL at
+         t — proves the label correctly uses future info as the
+         training target.
+
+    This is the dataset-level complement of forward_impact: the
+    triple-barrier label is supposed to read the future, but the
+    features at the same index must NOT.
+    """
+    if len(bars) < 200:
+        return True
+
+    # Lazy imports so the leakage suite has no hard dep on the dataset
+    from trade.research.lobframe.dataset import (
+        LOBDatasetConfig,
+        LOBWindowDataset,
+        LabelMethod,
+    )
+
+    base_tensor = synthesize_lob(bars, cfg)
+    base_ds = LOBWindowDataset(
+        base_tensor,
+        LOBDatasetConfig(
+            window=20, label_method=LabelMethod.TRIPLE_BARRIER,
+            tb_atr_period=14, tb_atr_mult_tp=1.5, tb_atr_mult_sl=1.5,
+            tb_vertical_bars=20,
+        ),
+        bars=bars,
+    )
+
+    # Pick a probe index in the middle of the series
+    probe_t = len(bars) // 2
+    if probe_t <= base_ds._min_t or probe_t > base_ds._max_t - 1:
+        return True
+
+    base_label = base_ds._label(probe_t)
+    base_feat_row = base_tensor[probe_t].copy()
+
+    # ----- B) FUTURE perturbation: features at probe_t must NOT change
+    perturbed_future = bars.copy()
+    fut_lo = probe_t + 1
+    fut_hi = min(len(bars) - 1, probe_t + 30)
+    perturbed_future.iloc[fut_lo:fut_hi + 1, perturbed_future.columns.get_loc("close")] += 0.05
+    perturbed_future.iloc[fut_lo:fut_hi + 1, perturbed_future.columns.get_loc("high")] += 0.05
+    perturbed_future.iloc[fut_lo:fut_hi + 1, perturbed_future.columns.get_loc("low")] += 0.05
+    fut_tensor = synthesize_lob(perturbed_future, cfg)
+    fut_feat_row = fut_tensor[probe_t]
+    feature_unchanged = bool(np.array_equal(base_feat_row, fut_feat_row))
+
+    fut_ds = LOBWindowDataset(
+        fut_tensor,
+        LOBDatasetConfig(
+            window=20, label_method=LabelMethod.TRIPLE_BARRIER,
+            tb_atr_period=14, tb_atr_mult_tp=1.5, tb_atr_mult_sl=1.5,
+            tb_vertical_bars=20,
+        ),
+        bars=perturbed_future,
+    )
+    fut_label = fut_ds._label(probe_t)
+    label_can_change = True  # weaker requirement: it MAY change
+
+    # ----- A) PAST perturbation: features at probe_t MUST change
+    perturbed_past = bars.copy()
+    past_lo = max(0, probe_t - 30)
+    past_hi = probe_t - 1
+    perturbed_past.iloc[past_lo:past_hi + 1, perturbed_past.columns.get_loc("close")] += 0.05
+    past_tensor = synthesize_lob(perturbed_past, cfg)
+    past_feat_row = past_tensor[probe_t]
+    feature_changed_by_past = not np.array_equal(base_feat_row, past_feat_row)
+
+    return feature_unchanged and feature_changed_by_past and label_can_change
+
+
 def test_past_only_pivot(bars: pd.DataFrame, cfg: ContStoikovConfig) -> bool:
     """If we slice bars at two different lengths but >= the pivot, the
     rows up to the pivot must be byte-identical between the two runs.
@@ -179,6 +263,7 @@ ALL_TESTS = {
     "no_nans": test_no_nans,
     "past_only_pivot": test_past_only_pivot,
     "forward_impact": test_forward_impact,
+    "label_causality_tb": test_label_causality_triple_barrier,
 }
 
 

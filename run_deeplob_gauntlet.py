@@ -31,7 +31,12 @@ from rich.table import Table
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from trade.research.lobframe import calibrated_config, synthesize_lob
-from trade.research.lobframe.dataset import LOBDatasetConfig
+from trade.research.lobframe.dataset import (
+    LabelMethod,
+    LOBDatasetConfig,
+    LOBWindowDataset,
+)
+from trade.research.lobframe.leakage_tests import run_all as run_leakage
 from trade.research.lobframe.train import TrainConfig, save_model, train_deeplob
 from trade.research.strategies.deeplob_strategy import DeepLOBStrategy
 from trade.validation.cpcv import CPCV
@@ -81,8 +86,42 @@ def main() -> int:
     tensor = synthesize_lob(bars, cfg)
     console.print(f"  bars={bars.shape} tensor={tensor.shape}")
 
-    # ---------- Training ----------
-    console.print("\n  [bold]Training DeepLOB[/bold]")
+    # ---------- Pre-train: leakage suite (incl. label causality) ----------
+    console.print("\n  [bold]Pre-train: leakage suite[/bold]")
+    leak = run_leakage(bars, cfg)
+    leak_passed = sum(int(v) for v in leak.values())
+    for name, ok in leak.items():
+        mark = "PASS" if ok else "FAIL"
+        console.print(f"    [{mark}] {name}")
+    console.print(f"    {leak_passed}/{len(leak)} leakage tests passed")
+    if leak_passed != len(leak):
+        console.print("    [red]ABORT: leakage suite failed[/red]")
+        return 1
+
+    # ---------- Triple-barrier dataset and class weights ----------
+    ds_cfg = LOBDatasetConfig(
+        window=WINDOW,
+        normalize=True,
+        label_method=LabelMethod.TRIPLE_BARRIER,
+        tb_atr_period=14,
+        tb_atr_mult_tp=2.0,
+        tb_atr_mult_sl=2.0,
+        tb_vertical_bars=50,
+    )
+    label_ds = LOBWindowDataset(tensor, ds_cfg, bars=bars)
+    dist = label_ds.label_distribution()
+    weights = label_ds.class_weights()
+    console.print(
+        f"\n  [bold]Triple-barrier label distribution[/bold] "
+        f"down={dist[0]} flat={dist[1]} up={dist[2]}"
+    )
+    console.print(
+        f"  class weights (down/flat/up) = "
+        f"({float(weights[0]):.2f}, {float(weights[1]):.2f}, {float(weights[2]):.2f})"
+    )
+
+    # ---------- Training with weighted CE ----------
+    console.print("\n  [bold]Training DeepLOB (triple barrier + weighted CE)[/bold]")
     train_cfg = TrainConfig(
         epochs=4,
         batch_size=64,
@@ -91,11 +130,12 @@ def main() -> int:
         val_fraction=0.3,
         early_stop_patience=2,
     )
-    ds_cfg = LOBDatasetConfig(window=WINDOW, horizon=5, tau=1e-4)
     model, summaries = train_deeplob(
         tensor,
         cfg=train_cfg,
         dataset_cfg=ds_cfg,
+        bars=bars,
+        class_weights=weights,
         log_fn=lambda s: console.print(s),
     )
     if not summaries:
