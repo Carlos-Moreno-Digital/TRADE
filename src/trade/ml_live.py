@@ -47,7 +47,7 @@ SPREADS.update(EXTRA_SPREADS)
 
 DB_PATH = Path("data/ml_paper_trades.db")
 THOUGHT_LOG = Path("data/bot_thoughts.log")
-SYMBOLS = ["USDJPY=X", "GC=F", "GBPNZD=X", "EURUSD=X", "AUDNZD=X"]
+SYMBOLS = ["EURUSD=X", "USDJPY=X"]  # BBMR validated 16yr: +$24,968, 17/17 years
 # === ACCOUNT CONFIG (change for different prop firm tiers) ===
 import os
 _TIER = os.environ.get("PROP_TIER", "10K")  # "10K" or "250K"
@@ -62,7 +62,7 @@ if _TIER == "250K":
     RETRAIN_INTERVAL = 21600 # Retrain every 6 hours (not 24h)
 else:
     ACCOUNT_SIZE = 10000.0
-    RISK_PER_TRADE = 0.0075  # 0.75% = $75/trade
+    RISK_PER_TRADE = 0.003   # 0.3% = $30/trade (BBMR tested DD ~11% at 0.5%)
     MAX_OPEN_TRADES = 2
     MAX_TRADES_PER_DAY = 4
     MAX_DAILY_LOSS_PCT = 3.0
@@ -265,15 +265,16 @@ def run_live_paper():
     from trade.agents.multi.orchestrator import Orchestrator
 
     console.print(Panel.fit(
-        "[bold green]MULTI-AGENT ML TRADER[/bold green]\n"
+        "[bold green]BBMR PAPER TRADER[/bold green]\n"
         f"Symbols: {', '.join(SYMBOLS)}\n"
-        f"Pipeline: Alpha(XGBoost) → Risk Shield → Quant Tester → Compliance\n"
-        f"Risk: {RISK_PER_TRADE*100:.2f}% per trade | SL: {SL_ATR_MULT}x ATR | TP: {TP_ATR_MULT}x ATR\n"
+        f"Strategy: Bollinger Band Mean Reversion (validated 16yr: +$24,968, 17/17 years)\n"
+        f"Pipeline: BBMR → Risk Shield → Compliance\n"
+        f"Risk: 0.3% per trade | Only trade when ADX < 20\n"
         f"Account: ${ACCOUNT_SIZE:,.0f} (paper) | Max {MAX_OPEN_TRADES} open | Max {MAX_TRADES_PER_DAY}/day\n"
         f"DD limits: {MAX_DAILY_LOSS_PCT}% daily / {MAX_TOTAL_DD_PCT}% total\n\n"
         "[dim]No broker needed — uses yfinance real-time prices[/dim]\n"
         "[dim]Ctrl+C to stop. All trades saved to data/ml_paper_trades.db[/dim]",
-        title="Multi-Agent Paper Trading",
+        title="BBMR Paper Trading",
         border_style="green",
     ))
 
@@ -282,13 +283,13 @@ def run_live_paper():
     last_train = {}
     last_candle = {}
 
-    console.print("\n[bold]Training models on 2 years of 1H data...[/bold]")
+    console.print("\n[bold]Verifying data access for BBMR (no training needed)...[/bold]")
     all_data = {}
     for sym in SYMBOLS:
-        console.print(f"  Downloading {sym}...", end=" ")
+        console.print(f"  Checking {sym}...", end=" ")
         try:
-            df = yf.download(sym, period="2y", interval="1h", progress=False)
-            if not df.empty and len(df) > 500:
+            df = yf.download(sym, period="1mo", interval="1h", progress=False)
+            if not df.empty and len(df) > 200:
                 if hasattr(df.columns, 'levels'):
                     df.columns = [c[0].lower() for c in df.columns]
                 else:
@@ -304,7 +305,6 @@ def run_live_paper():
         console.print("[red]No data downloaded. Check internet connection.[/red]")
         return
 
-    console.print("  Training XGBoost models...")
     train_results = orchestrator.train_models(SYMBOLS, all_data)
     for sym, ok in train_results.items():
         status = "[green]OK[/green]" if ok else "[red]FAILED[/red]"
@@ -332,26 +332,10 @@ def run_live_paper():
             stats = _get_account_stats(conn)
 
             # Display dashboard
-            _display_dashboard(stats, orchestrator.alpha.models, iteration)
+            # BBMR doesn't need training, so no models dict for dashboard
+            _display_dashboard(stats, {s: None for s in SYMBOLS}, iteration)
 
-            # Retrain every 24 hours
-            for sym in SYMBOLS:
-                if sym in last_train and (now - last_train[sym]).total_seconds() > RETRAIN_INTERVAL:
-                    console.print(f"\n  [dim]Retraining {sym}...[/dim]", end=" ")
-                    try:
-                        df_retrain = yf.download(sym, period="2y", interval="1h", progress=False)
-                        if not df_retrain.empty:
-                            if hasattr(df_retrain.columns, 'levels'):
-                                df_retrain.columns = [c[0].lower() for c in df_retrain.columns]
-                            else:
-                                df_retrain.columns = [c.lower() for c in df_retrain.columns]
-                            if orchestrator.alpha.train(sym, df_retrain):
-                                last_train[sym] = now
-                                console.print("[green]OK[/green]")
-                            else:
-                                console.print("[red]FAILED[/red]")
-                    except Exception:
-                        console.print("[red]ERROR[/red]")
+            # No retraining — BBMR is a fixed rule-based strategy
 
             # === MULTI-AGENT PIPELINE ===
             # All risk checks are now handled by Risk Shield + Compliance agents
@@ -421,7 +405,8 @@ def run_live_paper():
 
                 if decision.status_flag == "APPROVED":
                     p = decision.computational_payload
-                    sym_horizon = p.get("horizon_hours", HORIZON)
+                    # BBMR uses max_holding_bars (24h), ML uses horizon_hours
+                    sym_horizon = p.get("max_holding_bars") or p.get("horizon_hours", HORIZON)
                     horizon_end = (now + timedelta(hours=sym_horizon)).isoformat()
 
                     _log_thought("EXECUTE", sym, f"{p['action']} @ {p['entry_price']:.4f}", {

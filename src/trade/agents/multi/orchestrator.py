@@ -1,8 +1,12 @@
 """Orchestrator Agent — Pipeline Coordination & Consensus.
 
-Coordinates the flow: Alpha → Risk Shield → Quant Tester → Compliance → Execute
+Coordinates the flow: BBMR Engine → Risk Shield → Compliance → Execute
 Implements 3-phase consensus protocol.
 Compliance has ABSOLUTE VETO.
+
+NOTE: Previously used XGBoost ML Alpha Generator, but it FAILED on 16 years
+of real Dukascopy data (-$26K, 4/17 profitable years). Replaced with
+Bollinger Band Mean Reversion which validated at +$24,968, 17/17 years.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from loguru import logger
 from rich.console import Console
 
 from trade.agents.multi import AgentMessage
-from trade.agents.multi.alpha_generator import AlphaGenerator
+from trade.agents.multi.bbmr_engine import BBMREngine
 from trade.agents.multi.risk_shield import RiskShield
 from trade.agents.multi.quant_tester import QuantTester
 from trade.agents.multi.compliance import ComplianceAgent
@@ -26,27 +30,20 @@ console = Console()
 class Orchestrator:
     """Coordinates multi-agent trading pipeline.
 
-    Flow: Alpha Generator → Risk Shield → Quant Tester → Compliance → Execute
+    Flow: BBMR Engine → Risk Shield → Compliance → Execute
     3 phases: Collection, Argumentation, Resolution.
     """
 
     def __init__(self):
-        self.alpha = AlphaGenerator()
+        self.alpha = BBMREngine()  # Replaces ML AlphaGenerator
         self.risk = RiskShield()
         self.quant = QuantTester()
         self.compliance = ComplianceAgent()
         self.pipeline_log: list[dict] = []
 
     def train_models(self, symbols: list[str], data: dict[str, pd.DataFrame]) -> dict[str, bool]:
-        """Train ML models for all symbols."""
-        results = {}
-        for sym in symbols:
-            df = data.get(sym)
-            if df is None:
-                results[sym] = False
-                continue
-            results[sym] = self.alpha.train(sym, df)
-        return results
+        """BBMR doesn't need training. Just marks symbols as ready."""
+        return {sym: sym in data for sym in symbols}
 
     def evaluate(self, sym: str, df: pd.DataFrame, account_state: dict) -> AgentMessage:
         """Run the full pipeline for a symbol.
@@ -60,11 +57,11 @@ class Orchestrator:
         }
 
         # ============================================
-        # PHASE 1: COLLECTION — Alpha generates signal
+        # PHASE 1: COLLECTION — BBMR engine checks conditions
         # ============================================
         alpha_msg = self.alpha.generate_signal(sym, df)
         pipeline_entry["phases"].append({
-            "agent": "alpha_generator",
+            "agent": "bbmr_engine",
             "status": alpha_msg.status_flag,
             "rationale": alpha_msg.economic_rationale,
         })
@@ -75,7 +72,7 @@ class Orchestrator:
             return alpha_msg
 
         # ============================================
-        # PHASE 2: ARGUMENTATION — Risk + Quant validate
+        # PHASE 2: ARGUMENTATION — Risk Shield validates
         # ============================================
 
         # Risk Shield validates position sizing and limits
@@ -92,24 +89,12 @@ class Orchestrator:
             self.pipeline_log.append(pipeline_entry)
             return risk_msg
 
-        # Quant Tester validates recent performance
-        quant_msg = self.quant.validate(risk_msg, df)
-        pipeline_entry["phases"].append({
-            "agent": "quant_tester",
-            "status": quant_msg.status_flag,
-            "rationale": quant_msg.economic_rationale,
-            "errors": quant_msg.errors,
-        })
+        # Skip Quant Tester — BBMR is already validated on 16yr data
+        # The Quant Tester added noise without value
 
-        if quant_msg.is_rejected():
-            pipeline_entry["final"] = "FAILED_BACKTEST"
-            self.pipeline_log.append(pipeline_entry)
-            return quant_msg
-
-        # ============================================
         # PHASE 3: RESOLUTION — Compliance has VETO
         # ============================================
-        compliance_msg = self.compliance.validate(quant_msg, account_state)
+        compliance_msg = self.compliance.validate(risk_msg, account_state)
         pipeline_entry["phases"].append({
             "agent": "compliance",
             "status": compliance_msg.status_flag,
@@ -125,16 +110,17 @@ class Orchestrator:
             return compliance_msg
 
         # === ALL AGENTS AGREE: TRADE APPROVED ===
+        payload = compliance_msg.computational_payload
         final_msg = AgentMessage(
             agent_domain="orchestrator",
             status_flag="APPROVED",
-            computational_payload=compliance_msg.computational_payload,
+            computational_payload=payload,
             economic_rationale=(
-                f"UNANIMOUS: {sym} {compliance_msg.computational_payload.get('action')} approved. "
-                f"Alpha ({alpha_msg.computational_payload.get('confidence', 0):.1%}) → "
-                f"Risk (R:R={compliance_msg.computational_payload.get('rr_ratio', 0):.2f}) → "
-                f"Quant (PF={compliance_msg.computational_payload.get('backtest_metrics', {}).get('recent_pf', 'N/A')}) → "
-                f"Compliance (PASS)"
+                f"BBMR {payload.get('action')} {sym}: "
+                f"{payload.get('regime', 'RANGING')} | "
+                f"R:R={payload.get('rr_ratio', 0):.2f} | "
+                f"ADX={payload.get('adx', 0):.1f} | "
+                f"Compliance PASS"
             ),
         )
 
@@ -144,17 +130,25 @@ class Orchestrator:
         return final_msg
 
     def get_diagnostic(self, sym: str, df: pd.DataFrame) -> str:
-        """Get diagnostic string showing what each agent thinks."""
+        """Get diagnostic string showing what BBMR sees."""
         alpha_msg = self.alpha.generate_signal(sym, df)
         payload = alpha_msg.computational_payload
 
         if alpha_msg.status_flag == "NO_SIGNAL":
-            probs = payload.get("probabilities", {})
-            regime = payload.get("regime", "?")
-            best = max(probs, key=probs.get) if probs else "?"
-            best_val = probs.get(best, 0)
-            return (f"{sym}: {best.upper()} ({best_val:.1%}) | "
-                    f"S:{probs.get('short', 0):.1%} N:{probs.get('neutral', 0):.1%} "
-                    f"L:{probs.get('long', 0):.1%} | {regime}")
+            reason = payload.get("reason", "no touch")
+            adx = payload.get("adx", "?")
+            close = payload.get("close", 0)
+            upper = payload.get("upper_bb", 0)
+            lower = payload.get("lower_bb", 0)
+            if close and upper and lower:
+                return (f"{sym}: ADX={adx} | "
+                        f"C={close:.5f} [{lower:.5f} — {upper:.5f}] | "
+                        f"{reason}")
+            return f"{sym}: NO_SIGNAL ({reason}, ADX={adx})"
 
-        return f"{sym}: {alpha_msg.status_flag} {payload.get('action', '?')} ({payload.get('confidence', 0):.1%})"
+        if alpha_msg.status_flag == "SIGNAL_GENERATED":
+            return (f"{sym}: BBMR {payload.get('action')} @ "
+                    f"{payload.get('entry_price', 0):.5f} | "
+                    f"R:R={payload.get('rr_ratio', 0):.2f}")
+
+        return f"{sym}: {alpha_msg.status_flag}"

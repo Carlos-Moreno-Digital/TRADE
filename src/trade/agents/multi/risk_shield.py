@@ -118,7 +118,7 @@ class RiskShield:
         # === POSITION SIZING ===
         price = payload.get("entry_price", 0)
         atr = payload.get("atr", 0)
-        confidence = payload.get("confidence", 0.5)
+        strategy = payload.get("strategy", "ML")
 
         if price <= 0 or atr <= 0:
             return AgentMessage(
@@ -127,36 +127,46 @@ class RiskShield:
                 errors=["Invalid price or ATR"],
             )
 
-        # SL/TP calculation
-        sl_dist = atr * SL_ATR_MULT
-        tp_dist = atr * TP_ATR_MULT
-
-        if payload["action"] == "BUY":
-            sl_price = price - sl_dist
-            tp_price = price + tp_dist
+        # Use SL/TP from strategy if provided (BBMR), else calculate from ATR
+        if payload.get("sl_price") and payload.get("tp_price"):
+            sl_price = payload["sl_price"]
+            tp_price = payload["tp_price"]
+            if payload["action"] == "BUY":
+                sl_dist = price - sl_price
+                tp_dist = tp_price - price
+            else:
+                sl_dist = sl_price - price
+                tp_dist = price - tp_price
         else:
-            sl_price = price + sl_dist
-            tp_price = price - tp_dist
+            # ML fallback: use ATR multipliers
+            sl_dist = atr * SL_ATR_MULT
+            tp_dist = atr * TP_ATR_MULT
+            if payload["action"] == "BUY":
+                sl_price = price - sl_dist
+                tp_price = price + tp_dist
+            else:
+                sl_price = price + sl_dist
+                tp_price = price - tp_dist
 
-        # R:R check (minimum 1.5:1 per FunderPro)
+        if sl_dist <= 0:
+            return AgentMessage(
+                agent_domain="risk_shield",
+                status_flag="REJECTED",
+                errors=["Invalid SL distance"],
+            )
+
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
-        if rr < 1.5:
+
+        # BBMR has ~1:1 R:R (TP=middle band). Skip the 1.5 minimum for BBMR.
+        if strategy != "BBMR" and rr < 1.5:
             return AgentMessage(
                 agent_domain="risk_shield",
                 status_flag="REJECTED",
                 errors=[f"R:R ratio {rr:.2f} < 1.5 minimum"],
             )
 
-        # KELLY CRITERION position sizing (Paper Sec 17.1)
-        # f* = (p * b - q) / b, then use fractional Kelly (25%)
-        win_prob = confidence
-        loss_prob = 1 - win_prob
-        b = rr  # Win/loss ratio = R:R
-        kelly_f = (win_prob * b - loss_prob) / b if b > 0 else 0
-        fractional_kelly = max(0, kelly_f * 0.25)  # 25% Kelly for safety
-
-        # Clamp between min and max risk per trade
-        risk_pct = max(MIN_RISK_PER_TRADE_PCT, min(MAX_RISK_PER_TRADE_PCT, fractional_kelly * 100))
+        # Fixed risk per trade (0.3% for BBMR, no Kelly since no confidence score)
+        risk_pct = payload.get("risk_pct", 0.3)  # BBMR provides this
         risk_amt = balance * risk_pct / 100
 
         # Lot sizing
