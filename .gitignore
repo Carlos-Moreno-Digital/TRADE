@@ -1,3 +1,6 @@
+# Data (large binary datasets, not checked in)
+data/dukascopy/*.csv
+
 # Environment
 .env
 .venv/
