@@ -29,7 +29,7 @@ console = Console()
 
 DATA_DIR = Path("data/dukascopy")
 ACCOUNT = 10000
-RISK_PER_TRADE = 0.005  # 0.5% of account per trade
+RISK_PER_TRADE = 0.003  # 0.3% of account per trade (prop firm compliant)
 
 SYMBOL_CONFIG = {
     "EURUSD": {"spread": 0.00008, "pip_value": 10},
@@ -53,11 +53,11 @@ def load_dukascopy(symbol: str) -> pd.DataFrame:
 def backtest_bbmr(
     df: pd.DataFrame,
     spread: float,
-    bb_period: int = 20,
+    bb_period: int = 30,
     bb_std: float = 2.0,
     adx_max: int = 20,
-    atr_sl_mult: float = 1.5,
-    max_bars: int = 24,
+    atr_sl_mult: float = 1.0,
+    max_bars: int = 12,
 ) -> dict:
     """Bollinger Band Mean Reversion backtest with proper risk management."""
     close = df["close"].values.astype(float)
