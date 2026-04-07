@@ -18,6 +18,10 @@ import talib
 
 class DummyRandom:
     name: str = "DummyRandom"
+    # No edge by construction, so it is not authorized in any regime.
+    # The validation pipeline rejects it long before this matters, but
+    # the field is required by StrategyProtocol.
+    supported_regimes: list[int] = []
     default_params: dict[str, Any] = {
         "entry_prob": 0.05,   # ~5% of eligible bars
         "atr_sl_mult": 1.0,

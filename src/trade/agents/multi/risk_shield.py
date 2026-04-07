@@ -14,6 +14,7 @@ from datetime import datetime
 
 from trade.agents.multi import AgentMessage
 from trade.agents.multi.concentration_gate import ConcentrationGate
+from trade.agents.multi.regime_gate import RegimeGate
 
 # FunderPro Classic $10K limits
 ACCOUNT_SIZE = 10000.0
@@ -35,9 +36,14 @@ LEVERAGE = {"forex": 100, "metals": 30, "indices": 30, "crypto": 2}
 class RiskShield:
     """Refines signals with prop firm risk management."""
 
-    def __init__(self, concentration_gate: ConcentrationGate | None = None):
-        # Lazy default so unit tests can pass a mocked gate.
+    def __init__(
+        self,
+        concentration_gate: ConcentrationGate | None = None,
+        regime_gate: RegimeGate | None = None,
+    ):
+        # Lazy defaults so unit tests can pass mocked gates.
         self.concentration_gate = concentration_gate or ConcentrationGate()
+        self.regime_gate = regime_gate or RegimeGate()
 
     def validate_and_size(self, signal: AgentMessage, account_state: dict) -> AgentMessage:
         """Apply risk controls to a raw signal from Alpha Generator.
@@ -87,6 +93,27 @@ class RiskShield:
                     f"ConcentrationGate: {sym} would stack risk on "
                     f"{gate_decision.conflicting_symbol} "
                     f"(NMI={gate_decision.nmi_value:.3f})"
+                ),
+            )
+
+        # === REGIME GATE (Statistical Jump Model) ===
+        # Block strategies that fire in a regime they were NOT validated
+        # for. The strategy declares supported_regimes via the alpha
+        # engine and the gate consults the per-symbol SJM.
+        supported_regimes = payload.get("supported_regimes")
+        recent_close = payload.get("recent_close")  # optional pd.Series
+        regime_decision = self.regime_gate.check(
+            sym, supported_regimes, recent_close=recent_close
+        )
+        if not regime_decision.allowed:
+            return AgentMessage(
+                agent_domain="risk_shield",
+                status_flag="BLOCKED",
+                errors=[regime_decision.reason],
+                economic_rationale=(
+                    f"RegimeGate: {sym} active regime="
+                    f"{regime_decision.current_regime} not in "
+                    f"{regime_decision.supported_regimes}"
                 ),
             )
 

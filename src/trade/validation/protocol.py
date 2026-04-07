@@ -23,6 +23,12 @@ class StrategyProtocol(Protocol):
     name: str
     param_grid: dict[str, list[Any]]
     default_params: dict[str, Any]
+    # Regimes (Statistical Jump Model state ids) in which the strategy
+    # is permitted to trade. Default is ALL: every strategy must
+    # explicitly declare which regimes it was validated in via CPCV
+    # before being allowed in production. Empty list = strategy is
+    # currently not authorized in any regime.
+    supported_regimes: list[int]
 
     def signals(
         self, df: pd.DataFrame, params: dict[str, Any]

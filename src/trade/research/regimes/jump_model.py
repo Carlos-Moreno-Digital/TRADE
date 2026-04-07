@@ -1,5 +1,10 @@
 """Statistical Jump Model — Nystrup, Lindstrom, Madsen (2020).
 
+This module includes JSON serialization (to_dict / from_dict) so that
+trained models can be persisted to disk without pickle (cross-version
+safe). Production gates load these JSON files at startup.
+
+
 Optimizes the joint state-sequence + state-parameter problem
 
     min over (z, theta)
@@ -152,6 +157,53 @@ class StatisticalJumpModel:
             raise RuntimeError("Call fit() before predict()")
         X = self._scaler.transform(features.values.astype(float))
         return self._viterbi(X, self.fit_.centers, self.lambda_)
+
+    # ------------------------------------------------------------------
+    # Persistence (JSON, cross-version safe — no pickle)
+    # ------------------------------------------------------------------
+    def to_dict(self, feature_columns: list[str]) -> dict:
+        if self.fit_ is None or self._scaler is None:
+            raise RuntimeError("fit() before to_dict()")
+        return {
+            "kind": "StatisticalJumpModel",
+            "version": 1,
+            "n_states": int(self.n_states),
+            "lambda": float(self.lambda_),
+            "feature_columns": list(feature_columns),
+            "scaler_mean": self._scaler.mean_.tolist(),
+            "scaler_scale": self._scaler.scale_.tolist(),
+            "centers": self.fit_.centers.tolist(),
+            "n_jumps": int(self.fit_.n_jumps),
+            "inertia": float(self.fit_.inertia),
+            "objective": float(self.fit_.objective),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StatisticalJumpModel":
+        if data.get("kind") != "StatisticalJumpModel":
+            raise ValueError("Not a StatisticalJumpModel payload")
+        m = cls(
+            n_states=int(data["n_states"]),
+            lambda_=float(data["lambda"]),
+        )
+        scaler = StandardScaler()
+        scaler.mean_ = np.array(data["scaler_mean"], dtype=float)
+        scaler.scale_ = np.array(data["scaler_scale"], dtype=float)
+        scaler.var_ = scaler.scale_ ** 2
+        scaler.n_features_in_ = len(scaler.mean_)
+        m._scaler = scaler
+        centers = np.array(data["centers"], dtype=float)
+        m.fit_ = JumpModelFit(
+            states=np.array([], dtype=np.int64),
+            centers=centers,
+            n_jumps=int(data.get("n_jumps", 0)),
+            inertia=float(data.get("inertia", 0.0)),
+            objective=float(data.get("objective", 0.0)),
+            lambda_=float(data["lambda"]),
+            n_iter=0,
+        )
+        m.feature_columns_ = list(data["feature_columns"])
+        return m
 
     # ------------------------------------------------------------------
     # Diagnostics — small dictionaries only, never raw arrays
