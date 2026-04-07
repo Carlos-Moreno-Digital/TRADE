@@ -44,6 +44,34 @@ from trade.validation.protocol import StrategyProtocol
 
 
 @dataclass
+class PairNautilusResult:
+    strategy: str
+    primary_symbol: str
+    partner_symbol: str
+    primary_pnl: float
+    partner_pnl: float
+    combined_pnl: float
+    primary_trades: int
+    partner_trades: int
+    combined_return_pct: float
+
+    @property
+    def viable(self) -> bool:
+        return self.combined_pnl > 0
+
+    def summary(self) -> str:
+        return (
+            f"PairNautilus[{self.strategy}/{self.primary_symbol}+"
+            f"{self.partner_symbol}]: "
+            f"primary=${self.primary_pnl:+,.0f} "
+            f"partner=${self.partner_pnl:+,.0f} "
+            f"combined=${self.combined_pnl:+,.0f} "
+            f"({self.combined_return_pct:+.1f}%) "
+            f"=> {'VIABLE' if self.viable else 'REJECTED'}"
+        )
+
+
+@dataclass
 class NautilusResult:
     strategy: str
     symbol: str
@@ -343,4 +371,121 @@ class NautilusHarness:
             nautilus_trades=n_trades,
             final_balance=final_total,
             return_pct=nautilus_pnl / self.account * 100,
+        )
+
+    # ------------------------------------------------------------------
+    # Caveat #2 fix: 2-leg pair fill harness.
+    #
+    # The strategy must implement pair_signals(df, params) returning a
+    # DataFrame with columns:
+    #   bar_idx, primary_side, primary_sl, primary_tp,
+    #   partner_side, partner_sl, partner_tp
+    # We split it into two single-leg signal feeds and run each leg
+    # through the existing single-leg engine (one engine per leg, both
+    # walking the same time grid). Combined P&L = primary + partner.
+    #
+    # This is NOT a tick-level joint simulation — Nautilus would need
+    # cross-instrument positions for that — but it captures the
+    # economics of paying both bid/ask and is enough to give the pair
+    # strategy a fair shot in the gauntlet.
+    # ------------------------------------------------------------------
+    def run_pair(
+        self,
+        strategy: StrategyProtocol,
+        primary_bars: pd.DataFrame,
+        primary_symbol: str,
+        primary_pair: str,
+        primary_spread: float,
+        partner_bars: pd.DataFrame,
+        partner_symbol: str,
+        partner_pair: str,
+        partner_spread: float,
+    ) -> PairNautilusResult:
+        if not hasattr(strategy, "pair_signals"):
+            raise AttributeError(
+                f"{strategy.name} must implement pair_signals(df, params) "
+                "for run_pair()"
+            )
+        params = strategy.default_params
+        sig_df = strategy.pair_signals(primary_bars, params)
+
+        if sig_df.empty:
+            return PairNautilusResult(
+                strategy=strategy.name,
+                primary_symbol=primary_symbol,
+                partner_symbol=partner_symbol,
+                primary_pnl=0.0, partner_pnl=0.0, combined_pnl=0.0,
+                primary_trades=0, partner_trades=0,
+                combined_return_pct=0.0,
+            )
+
+        # Prebuilt-signals strategy wrapper: implements .signals() to
+        # return a fixed DataFrame (the pair_signals slice) and a no-op
+        # backtest. The harness only ever calls .signals().
+        class _PrebuiltSignals:
+            name = strategy.name
+            default_params = params
+            param_grid = strategy.param_grid
+
+            def __init__(self, signals_df: pd.DataFrame):
+                self._signals_df = signals_df
+
+            def signals(self, df, params):
+                return self._signals_df
+
+            def backtest(self, df, spread, params, signal_shift=0):
+                return []
+
+        primary_only = sig_df.rename(columns={
+            "primary_side": "side",
+            "primary_sl": "sl",
+            "primary_tp": "tp",
+        })[["bar_idx", "side", "sl", "tp"]]
+        partner_only = sig_df.rename(columns={
+            "partner_side": "side",
+            "partner_sl": "sl",
+            "partner_tp": "tp",
+        })[["bar_idx", "side", "sl", "tp"]]
+
+        primary_strategy = _PrebuiltSignals(primary_only)
+        partner_strategy = _PrebuiltSignals(partner_only)
+
+        primary_harness = NautilusHarness(
+            spread_abs=primary_spread,
+            commission_bps=self.commission_bps,
+            slip_prob=self.slip_prob,
+            account=self.account,
+            risk_per_trade=self.risk_per_trade,
+            max_holding_bars=self.max_holding_bars,
+            log_level=self.log_level,
+            seed=self.seed,
+        )
+        partner_harness = NautilusHarness(
+            spread_abs=partner_spread,
+            commission_bps=self.commission_bps,
+            slip_prob=self.slip_prob,
+            account=self.account,
+            risk_per_trade=self.risk_per_trade,
+            max_holding_bars=self.max_holding_bars,
+            log_level=self.log_level,
+            seed=self.seed + 1,
+        )
+        primary_res = primary_harness.run(
+            primary_strategy, primary_bars, primary_symbol, primary_pair,
+        )
+        partner_res = partner_harness.run(
+            partner_strategy, partner_bars, partner_symbol, partner_pair,
+        )
+
+        combined_pnl = primary_res.nautilus_pnl + partner_res.nautilus_pnl
+        return PairNautilusResult(
+            strategy=strategy.name,
+            primary_symbol=primary_symbol,
+            partner_symbol=partner_symbol,
+            primary_pnl=primary_res.nautilus_pnl,
+            partner_pnl=partner_res.nautilus_pnl,
+            combined_pnl=combined_pnl,
+            primary_trades=primary_res.nautilus_trades,
+            partner_trades=partner_res.nautilus_trades,
+            combined_return_pct=combined_pnl / self.account * 100,
         )

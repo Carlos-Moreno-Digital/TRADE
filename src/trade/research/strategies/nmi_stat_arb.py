@@ -62,6 +62,7 @@ Causality:
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,35 @@ class NMIStatArb:
             primary_symbol=primary_symbol,
             partner_symbol=partner_symbol,
         )
+
+    # ------------------------------------------------------------------
+    # Lockstep permutation hook (caveat #1 fix).
+    #
+    # ParanoidSuite.time_permutation calls this context manager just
+    # before each permuted backtest. We replace `self.partner` with a
+    # series whose log returns have been independently shuffled with
+    # the same RNG that the suite uses to shuffle the primary leg.
+    # The shuffle is INDEPENDENT (not lockstep with the primary)
+    # which is what we want: it destroys the cointegration relation
+    # so a strategy that depended on real cointegration cannot beat
+    # the null distribution by coincidence.
+    @contextmanager
+    def with_permuted_state(self, rng):
+        saved = self.partner.copy()
+        try:
+            prices = self.partner.values.astype(float)
+            if len(prices) >= 3:
+                log_rets = np.diff(np.log(prices))
+                permuted = rng.permutation(log_rets)
+                new_close = prices[0] * np.exp(
+                    np.concatenate([[0.0], np.cumsum(permuted)])
+                )
+                self.partner = pd.Series(
+                    new_close, index=self.partner.index, name=self.partner.name
+                )
+            yield
+        finally:
+            self.partner = saved
 
     # ------------------------------------------------------------------
     def _aligned_partner(self, df: pd.DataFrame) -> np.ndarray:
@@ -309,3 +339,50 @@ class NMIStatArb:
 
     def signals(self, df: pd.DataFrame, params: dict[str, Any]) -> pd.DataFrame:
         return self._walk(df, 0.0, params, 0, collect_signals=True)
+
+    # ------------------------------------------------------------------
+    # Caveat #2 fix: 2-leg pair signals.
+    #
+    # Returns one DataFrame describing both legs of every pair trade.
+    # PairNautilusHarness consumes it to fill simultaneously on the
+    # primary and partner instruments. The partner side is the
+    # OPPOSITE of the primary side (long primary -> short partner),
+    # which is the canonical stat-arb hedge.
+    # ------------------------------------------------------------------
+    def pair_signals(
+        self, df: pd.DataFrame, params: dict[str, Any]
+    ) -> pd.DataFrame:
+        primary = self._walk(df, 0.0, params, 0, collect_signals=True)
+        if primary.empty:
+            return pd.DataFrame(
+                columns=[
+                    "bar_idx", "primary_side", "primary_sl", "primary_tp",
+                    "partner_side", "partner_sl", "partner_tp",
+                ]
+            )
+        partner_close = self._aligned_partner(df)
+        rows = []
+        for row in primary.itertuples():
+            bar_idx_0 = int(row.bar_idx) - 1  # back to 0-based
+            if bar_idx_0 >= len(partner_close):
+                continue
+            partner_entry = float(partner_close[bar_idx_0])
+            sl_dist = abs(float(row.sl) - df["close"].iloc[bar_idx_0])
+            tp_dist = abs(float(row.tp) - df["close"].iloc[bar_idx_0])
+            partner_side = "sell" if row.side == "buy" else "buy"
+            if partner_side == "buy":
+                partner_sl = partner_entry - sl_dist
+                partner_tp = partner_entry + tp_dist
+            else:
+                partner_sl = partner_entry + sl_dist
+                partner_tp = partner_entry - tp_dist
+            rows.append({
+                "bar_idx": int(row.bar_idx),
+                "primary_side": row.side,
+                "primary_sl": float(row.sl),
+                "primary_tp": float(row.tp),
+                "partner_side": partner_side,
+                "partner_sl": float(partner_sl),
+                "partner_tp": float(partner_tp),
+            })
+        return pd.DataFrame(rows)

@@ -118,11 +118,23 @@ class ParanoidSuite:
 
     # -------- Test 2 --------
     def time_permutation(self, n_permutations: int = 500) -> dict:
+        """Time-permutation test.
+
+        For pair-trading or otherwise multi-input strategies, the
+        strategy may declare a `with_permuted_state(rng)` context
+        manager that the suite enters BEFORE running each permuted
+        backtest. The hook is responsible for swapping any internal
+        secondary inputs (e.g. partner price series) with shuffled
+        versions, then restoring them on exit. This is the lockstep
+        fix for the single-leg pair trading p=1.000 caveat.
+        """
         normal_pnls = np.array(self._pnls())
         normal_sr = _sharpe(normal_pnls)
         close = self.df["close"].values.astype(float)
         log_rets = np.diff(np.log(close))
         spread_pct = ((self.df["high"] - self.df["low"]) / self.df["close"]).values
+
+        has_state_hook = hasattr(self.strategy, "with_permuted_state")
 
         shuffled_srs = np.zeros(n_permutations)
         for k in range(n_permutations):
@@ -136,7 +148,11 @@ class ParanoidSuite:
                 "low": new_close * (1 - shuf_spread / 2),
                 "volume": self.df.get("volume", 1),
             }, index=self.df.index)
-            pnls = self.strategy.backtest(df_s, self.spread, self.params)
+            if has_state_hook:
+                with self.strategy.with_permuted_state(self.rng):
+                    pnls = self.strategy.backtest(df_s, self.spread, self.params)
+            else:
+                pnls = self.strategy.backtest(df_s, self.spread, self.params)
             shuffled_srs[k] = _sharpe(np.array(pnls))
 
         p_value = float((shuffled_srs >= normal_sr).mean())
