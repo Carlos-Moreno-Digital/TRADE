@@ -85,6 +85,20 @@ BEST_PARAMS = {
         "rf_n_estimators": 50, "rf_max_depth": 4, "rf_min_samples_leaf": 5,
         "vertical_bars": 100, "meta_threshold": 0.0,
     },
+    "GBPNZD": {
+        "donchian_period": 15, "atr_sl_mult": 1.5, "atr_tp_mult": 2.0,
+        "max_holding": 24, "atr_period": 14,
+        "mr_lookback": 20, "mr_z_entry": 2.0, "mr_z_exit": 0.5,
+        "rf_n_estimators": 100, "rf_max_depth": 4, "rf_min_samples_leaf": 5,
+        "vertical_bars": 100, "meta_threshold": 0.0003,
+    },
+    "XAUUSD": {
+        "donchian_period": 20, "atr_sl_mult": 1.0, "atr_tp_mult": 2.0,
+        "max_holding": 12, "atr_period": 14,
+        "mr_lookback": 20, "mr_z_entry": 2.0, "mr_z_exit": 0.5,
+        "rf_n_estimators": 100, "rf_max_depth": 4, "rf_min_samples_leaf": 5,
+        "vertical_bars": 50, "meta_threshold": 0.0,
+    },
 }
 DEFAULT_PARAMS = {
     "donchian_period": 20, "atr_sl_mult": 1.5, "atr_tp_mult": 3.0,
