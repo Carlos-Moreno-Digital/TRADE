@@ -22,9 +22,14 @@ OUT_DIR = Path("data/regimes")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Auto-tuned lambdas from train_jump_model.py sweep (the elbows).
+# GBPNZD, AUDNZD, XAUUSD use default lambda=5.0 (EURUSD elbow) until
+# their own sweep is run on the VPS.
 SYMBOLS = {
     "EURUSD": 5.0,
     "USDJPY": 2.5,
+    "GBPNZD": 5.0,
+    "AUDNZD": 5.0,
+    "XAUUSD": 5.0,
 }
 N_STATES = 2
 
