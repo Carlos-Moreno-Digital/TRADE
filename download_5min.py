@@ -42,7 +42,7 @@ SYMBOLS = {
 
 START_YEAR = 2010
 END = datetime(2026, 4, 1)
-WORKERS = 5
+WORKERS = 20
 SAVE_EVERY_DAYS = 30
 
 
@@ -157,7 +157,7 @@ def download_symbol(symbol: str, pip: float):
                         bars_5m = ticks_to_5min(ticks, futures[f])
                         all_bars.extend(bars_5m)
             batch_hours = []
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         # Progress + intermediate save
         done = hi + 1
