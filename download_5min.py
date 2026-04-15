@@ -43,7 +43,7 @@ SYMBOLS = {
 START_YEAR = 2010
 END = datetime(2026, 4, 1)
 WORKERS = 5
-SAVE_EVERY_DAYS = 30
+SAVE_EVERY_DAYS = 3  # save more often so wc -l progress is visible
 
 
 def fetch_hour_ticks(symbol: str, pip: float, dt: datetime) -> list[dict] | None:
@@ -140,6 +140,8 @@ def download_symbol(symbol: str, pip: float):
     batch_hours = []
     last_save = time.time()
     t0 = time.time()
+    hits = 0
+    misses = 0
 
     for hi, hour_dt in enumerate(hours):
         batch_hours.append(hour_dt)
@@ -156,18 +158,23 @@ def download_symbol(symbol: str, pip: float):
                     if ticks:
                         bars_5m = ticks_to_5min(ticks, futures[f])
                         all_bars.extend(bars_5m)
+                        hits += 1
+                    else:
+                        misses += 1
             batch_hours = []
             time.sleep(0.2)
 
         # Progress + intermediate save
         done = hi + 1
-        if done % 500 == 0 or time.time() - last_save > SAVE_EVERY_DAYS * 86400 / len(hours) * 500:
+        if done % 100 == 0:
             elapsed = time.time() - t0
             rate = done / max(elapsed, 1)
             eta = (len(hours) - done) / max(rate, 0.01)
+            hit_rate = hits / max(hits + misses, 1) * 100
             print(f"    {symbol}: {done:,}/{len(hours):,} hours "
                   f"({len(all_bars):,} bars) "
-                  f"rate={rate:.0f}h/s eta={eta/60:.0f}min", flush=True)
+                  f"rate={rate:.0f}h/s hit_rate={hit_rate:.0f}% "
+                  f"eta={eta/60:.0f}min", flush=True)
 
         # Save every SAVE_EVERY_DAYS worth of hours
         if done % (SAVE_EVERY_DAYS * 24) == 0:
